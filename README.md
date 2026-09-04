@@ -360,6 +360,32 @@ The voice client transforms agent output before TTS:
 This means the LLM can return markdown or tool traces, and the user
 hears only the human-readable parts.
 
+## Streaming TTS (V5+)
+
+Starting with V5, the voice client speaks sentences **as soon as the
+LLM produces them** — it does not wait for the full reply.
+
+How it works:
+
+1. The agent streams `agent.text` deltas over WebSocket.
+2. The voice client's `StreamingRenderer` buffers deltas and flushes a
+   chunk at every sentence boundary (``.``, `!`, `?` followed by
+   whitespace). It also forces a flush at `max_chunk_chars` (default
+   240) so long run-on sentences don't accumulate forever.
+3. Each flushed chunk is queued in `_TTSSpeaker`, which has N
+   background worker threads (default 2) that synthesize the chunks
+   in parallel and play them back in submission order.
+4. Code blocks (`` ``` ... ``` ``) are dropped from the spoken
+   output entirely (skipping over them, never emitting them).
+
+The effect: when the LLM finishes writing "Hello, world.", the user
+hears "Hello, world." within a few hundred milliseconds — well
+before the LLM finishes writing the rest of the reply.
+
+Disable streaming with `--tts-backend say` (synth the whole reply
+in one shot) or `--tts-backend none` (silent). OpenAI and Kokoro
+both stream.
+
 ## Available tools
 
 | Tool              | Category    | Description                                          |
