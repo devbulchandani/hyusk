@@ -13,10 +13,14 @@ from ..llm.provider import LLMProvider
 from ..permissions.policy import PermissionPolicy
 from ..plugins.loader import load_plugins
 from ..tools.filesystem.tools import register_filesystem_tools
+from ..tools.find import register_find_tools
 from ..tools.git.tools import register_git_tools
 from ..tools.process.tools import register_process_tools
 from ..tools.registry import ToolRegistry
 from ..tools.shell.tools import register_shell_tools
+from ..tools.system import register_system_info_tools
+from ..tools.web import register_web_tools
+from ..tools.env import register_env_tools
 
 
 def build_registry(load_user_plugins: bool = True) -> ToolRegistry:
@@ -26,6 +30,10 @@ def build_registry(load_user_plugins: bool = True) -> ToolRegistry:
     register_shell_tools(reg)
     register_process_tools(reg)
     register_git_tools(reg)
+    register_system_info_tools(reg)
+    register_env_tools(reg)
+    register_find_tools(reg)
+    register_web_tools(reg)
     if load_user_plugins:
         load_plugins(reg)
     return reg
