@@ -247,6 +247,28 @@ class DaemonClient:
                 except Exception:
                     pass
             await self._send({"type": "grant", "ask_id": ask.ask_id, "granted": granted})
+        elif mtype == "version":
+            fut = self._pending.pop("version", None)
+            if fut and not fut.done():
+                fut.get_loop().call_soon_threadsafe(fut.set_result, msg)
+        elif mtype == "task_detail":
+            task = msg.get("task", {})
+            tid = task.get("id")
+            fut = self._pending.pop(f"task_detail:{tid}", None) if tid else None
+            if fut and not fut.done():
+                fut.get_loop().call_soon_threadsafe(fut.set_result, task)
+        elif mtype == "compacted":
+            sid = msg.get("session_id")
+            fut = self._pending.pop(f"compact:{sid}", None) if sid else None
+            if fut and not fut.done():
+                fut.get_loop().call_soon_threadsafe(
+                    fut.set_result, msg.get("new_session_id", "")
+                )
+        elif mtype == "discarded":
+            tid = msg.get("task_id")
+            fut = self._pending.pop(f"discard:{tid}", None) if tid else None
+            if fut and not fut.done():
+                fut.get_loop().call_soon_threadsafe(fut.set_result, True)
         elif mtype == "task_done":
             done = TaskDone(
                 task_id=msg["task_id"],
@@ -261,7 +283,6 @@ class DaemonClient:
                     cb(done)
                 except Exception:
                     pass
-            # Resolve any future keyed on this task.
             fut = self._pending.pop(f"done:{done.task_id}", None)
             if fut and not fut.done():
                 fut.get_loop().call_soon_threadsafe(fut.set_result, done)
@@ -278,14 +299,18 @@ class DaemonClient:
                     cb(msg.get("tasks", []))
                 except Exception:
                     pass
+            for key in ("list_tasks_all", "tasks"):
+                fut = self._pending.pop(key, None)
+                if fut and not fut.done():
+                    fut.get_loop().call_soon_threadsafe(
+                        fut.set_result, msg.get("tasks", [])
+                    )
         elif mtype == "task":
-            # New task started.
             fut = self._pending.pop("task", None)
             if fut and not fut.done():
                 fut.get_loop().call_soon_threadsafe(
                     fut.set_result, Task(id=msg["task_id"], session_id=msg["session_id"])
                 )
-
     async def _send(self, payload: dict) -> None:
         assert self._ws is not None
         await self._ws.send(json.dumps(payload))
@@ -351,6 +376,48 @@ class DaemonClient:
 
     def on_error(self, cb: Callable[[str], None]) -> None:
         self._on_error.append(cb)
+
+    # ---- V4 methods ----
+
+    async def version(self) -> dict:
+        """Return the daemon's version and protocol number."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict] = loop.create_future()
+        self._pending["version"] = fut
+        await self._send({"type": "version"})
+        return await asyncio.wait_for(fut, timeout=5.0)
+
+    async def task_detail(self, task_id: str) -> dict:
+        """Return full task info including the transcript."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict] = loop.create_future()
+        self._pending[f"task_detail:{task_id}"] = fut
+        await self._send({"type": "task_detail", "task_id": task_id})
+        return await asyncio.wait_for(fut, timeout=5.0)
+
+    async def list_tasks_all(self) -> list[dict]:
+        """List in-memory + persisted tasks."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[list] = loop.create_future()
+        self._pending["list_tasks_all"] = fut
+        await self._send({"type": "list_tasks_all"})
+        return await asyncio.wait_for(fut, timeout=5.0)
+
+    async def compact_session(self, session_id: str) -> str:
+        """Ask the daemon to summarize a session. Returns the new session id."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        self._pending[f"compact:{session_id}"] = fut
+        await self._send({"type": "compact_session", "session_id": session_id})
+        return await asyncio.wait_for(fut, timeout=60.0)
+
+    async def discard_task(self, task_id: str) -> bool:
+        """Drop a persisted task record."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[bool] = loop.create_future()
+        self._pending[f"discard:{task_id}"] = fut
+        await self._send({"type": "discard_task", "task_id": task_id})
+        return await asyncio.wait_for(fut, timeout=5.0)
 
 
 def run_over_daemon_sync(**kwargs) -> RunOutcome:
