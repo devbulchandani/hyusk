@@ -1,10 +1,10 @@
 # Hyusk Architecture
 
-This document describes the major interfaces and boundaries in Hyusk V3.
-V1 laid out the core (errors, events, tools, permissions, agent loop,
-sessions, platform, LLM abstraction). V2 layered a daemon + WebSocket
-transport and streaming LLM responses. V3 layers **concurrent agent runs
-with steering and cancellation** on top — without changing the core.
+This document describes the major interfaces and boundaries in Hyusk V4.
+V1 laid out the core. V2 layered a daemon + WebSocket transport and
+streaming. V3 added concurrent agent tasks with steering and
+cancellation. V4 adds **persistent state**, a **voice client**,
+**session compaction**, and a **plugin system**.
 
 ## Goals
 
@@ -16,8 +16,10 @@ with steering and cancellation** on top — without changing the core.
 5. Future clients (mobile, voice, remote, WebSocket) plug in without
    touching the core.
 6. The agent loop is streaming-aware.
-7. **The user can run multiple tasks in parallel and steer them.**
-   The CLI stays responsive even while long tasks run.
+7. The user can run multiple tasks in parallel and steer them.
+8. **V4:** task state survives daemon restarts. Sessions can be
+   compacted. The agent core is extensible via user plugins. Voice
+   clients work today.
 
 ## High-level shape
 
@@ -31,11 +33,12 @@ with steering and cancellation** on top — without changing the core.
                 │  Session Manager    │
                 │  Event Bus          │
                 │  LLM Provider       │
+                │  Plugin Loader (V4) │
                 └─────────┬───────────┘
                           │
        ┌──────────────────┼──────────────────┐
        ▼                  ▼                  ▼
-   CLI (V3)         Voice (V4)         Mobile (V4)
+   CLI (V4)         Voice (V4)         Mobile (V5)
    WebSocket         WebSocket          WebSocket
    client             client             client
        │                  │                  │
@@ -45,172 +48,158 @@ with steering and cancellation** on top — without changing the core.
                 ┌─────────────────────┐
                 │   HYUSK DAEMON      │
                 │   WebSocket server  │
-                │   (V3: concurrent   │
-                │    tasks + ask      │
-                │    routing)         │
+                │   (V4: persistent   │
+                │    tasks, ask      │
+                │    routing,         │
+                │    plugin loader)   │
                 └─────────┬───────────┘
                           │
                           ▼
                 ┌─────────────────────┐
                 │   TASK MANAGER      │
-                │   (V3)              │
-                │  Owns a thread per  │
-                │  task. Each task    │
-                │  has its own        │
-                │  Agent, session,    │
-                │  and event stream.  │
+                │   + TASK STORE (V4) │
+                │  Persists TaskInfo  │
+                │  to disk; restore() │
+                │  marks running      │
+                │  tasks as           │
+                │  INTERRUPTED.       │
                 └─────────────────────┘
 ```
 
-## V3 deltas
+## V4 deltas
 
-### `agent/tasks.py` — TaskManager
+### `agent/tasks.py` — `TaskStore` + `TaskInfo` extensions + `INTERRUPTED`
 
-The single most important V3 addition. A `TaskManager` owns a registry of
-`Task` objects. Each `Task` runs `Agent.run()` in its own thread with its
-own `EventBus`. Tasks can run concurrently without blocking each other.
+- `TaskInfo` now carries an optional `transcript: list[dict]` of session
+  messages for inspection after a restart.
+- `TaskInfo.from_dict()` was added so records can be reloaded from disk.
+- `TaskState.INTERRUPTED` is a new state for tasks that were running
+  when the daemon was last killed.
+- `TaskStore` is a new class in the same module. It writes each task's
+  `TaskInfo` to `<user_config>/hyusk/tasks/<id>.json` on every state
+  change.
+- `TaskManager` now accepts an optional `store` argument. When set, it
+  hooks into `Task._set_state()` and persists the latest snapshot
+  after every state transition.
+- `TaskManager.restore()` is called once at daemon startup. It loads
+  every persisted task and marks any that were `RUNNING` or `PENDING`
+  as `INTERRUPTED`, appending `[interrupted by daemon restart]` to
+  the error message.
+- The `_consume` method now updates `self.session.messages` **before**
+  setting the final state, so any state-change callback (e.g. the
+  `TaskStore.save`) sees the full transcript.
 
-Public API:
+### `daemon/server.py` — V4 protocol
 
-- `TaskManager.submit(input_text=..., session=...)` — start a new task.
-  Returns a `Task` handle. The agent begins running immediately.
-- `Task.steer(message)` — queue a follow-up user message. The agent loop
-  drains the queue between tool calls.
-- `Task.cancel()` — request cancellation. The agent loop checks the
-  cancel flag at safe points (between LLM calls, between tool calls).
-- `Task.events()` — return a `(queue, unsubscribe)` pair. The queue
-  receives every event the agent publishes. Safe to call before or
-  after the task starts.
-- `Task.info()` / `Task.result(timeout=None)` — snapshot the task state
-  or block until it finishes.
+- New messages handled:
+  - `{"type": "version"}` → `{"type": "version", "version": "0.4.0",
+    "protocol": 4}`.
+  - `{"type": "task_detail", "task_id": "..."}` → full `TaskInfo` from
+    the `TaskStore`, including the transcript.
+  - `{"type": "list_tasks_all"}` → union of in-memory + persisted
+    tasks.
+  - `{"type": "compact_session", "session_id": "..."}` → asks the LLM
+    to summarize the session, writes a new session with the summary,
+    returns `{"type": "compacted", "new_session_id": "..."}`. Falls back
+    to a deterministic stub if the LLM is unreachable.
+  - `{"type": "discard_task", "task_id": "..."}` → removes the persisted
+    record. Does not affect the session.
 
-**V3 design choice (and why we did it this way):** the Task has its own
-internal subscribers list rather than routing events through the agent's
-bus. The agent's bus already has a subscriber (the EventStream's
-`on_event`) that puts events into the EventStream's queue. If we added
-the daemon's queue subscriber directly to the bus, broadcasts would
-trigger feedback loops (the queue subscriber would re-enqueue events
-that the EventStream was also trying to deliver). The Task's separate
-list, fed by the watcher thread that consumes the EventStream, avoids
-this.
+### `client/client.py` — V4 client methods
 
-### `agent/loop.py` — steering + cancellation
+- `DaemonClient.version()` — protocol handshake.
+- `DaemonClient.task_detail(task_id)` — full task info.
+- `DaemonClient.list_tasks_all()` — union of in-memory + persisted.
+- `DaemonClient.compact_session(session_id)` — request compaction,
+  return new session id.
+- `DaemonClient.discard_task(task_id)` — drop a persisted record.
 
-The agent loop now:
+### `voice/client.py` — V4 voice client (NEW)
 
-- Calls `self._drain_steering(messages)` at the top of each iteration.
-  This appends any queued follow-up user messages to the conversation.
-- Checks `self._cancelled.is_set()` at the start of each iteration and
-  between tool calls. The current tool call is allowed to finish; we do
-  not interrupt it (that would require provider-specific cancellation
-  which is V4 work).
-- In streaming mode, also breaks out of the stream loop on cancel so
-  the LLM call returns early.
+A standalone async CLI process that connects to the daemon via
+`DaemonClient` and submits user input as `run` messages. Two modes:
 
-`AgentLoopLimit` still propagates to callers (V2 contract preserved).
-The `Task` wrapper catches it and sets state to `errored`.
+- `--text`: read lines from stdin. Default; works in any environment.
+- `--mic`: capture from the microphone. Falls back to a stub unless
+  `sounddevice` is installed; STT is intentionally not bundled.
 
-### `daemon/server.py` — V3 protocol
+This demonstrates the V2/V3 protocol working across process
+boundaries, and is the template a future mobile or web client can
+follow.
 
-The WebSocket protocol gained:
+### `plugins/loader.py` — V4 plugin discovery (NEW)
 
-- `{"type": "run", ...}` now returns a `{"type": "task", "task_id": "...",
-  "session_id": "..."}` message immediately, then streams events. The
-  events are tagged with the `task_id` so multiple concurrent tasks can
-  be multiplexed by the client.
-- `{"type": "list_tasks"}` returns the current task list.
-- `{"type": "cancel", "task_id": "..."}` cancels a task.
-- `{"type": "steer", "task_id": "...", "input": "..."}` injects a
-  follow-up user message.
-- `{"type": "ask", ...}` is sent to the client that started the task
-  when the policy says `ask`. The client replies with
-  `{"type": "grant", "ask_id": "...", "granted": bool}`.
+`load_plugins(registry, plugin_dir=...)` imports every `*.py` file in
+the user plugin dir and calls its `register(registry)`. Used by the
+daemon at startup and by the CLI's in-process agent as a fallback.
+Broken plugins are logged and skipped.
 
-The daemon's `TaskManager` is created once at startup and shared by
-all clients. Concurrent clients can submit, steer, and cancel tasks
-independently.
+### `config/config.py` — `user_config_dir` respects `HYUSK_CONFIG_DIR`
 
-### `client/client.py` — V3 client
+A new env var `HYUSK_CONFIG_DIR` overrides the platform-default
+config dir. Useful for tests and for users who want to relocate the
+config dir. On macOS and Linux, `XDG_CONFIG_HOME` is also respected
+(previously macOS ignored it).
 
-The WebSocket client gained:
+### `cli/app.py` — V4 CLI flags
 
-- A `DaemonClient` class that maintains a persistent connection and
-  exposes `submit`, `cancel`, `steer`, `list_tasks`, `wait_done`,
-  plus `on_event`, `on_ask`, `on_done`, `on_error` callbacks.
-- `run_over_daemon_sync()` for one-shot use (the CLI uses it for
-  one-shot commands).
+- `--voice` enters the voice client.
+- `--text` / `--mic` select the voice mode.
+- `--host` / `--port` override the daemon endpoint.
+- `--no-tts` disables TTS for the reply.
 
-### `cli/app.py` — V3 REPL
-
-The REPL gained:
-
-- `bg: <prompt>` — start a background task without waiting.
-- `steer <id> <message>` — inject a follow-up.
-- `cancel <id>` — cancel a running task.
-- `tasks` — list active and recent tasks.
-
-The `_render_event()` helper now prefixes output with `[task_id]` so
-output from background tasks is distinguishable from foreground output.
-In the daemon-backed REPL, all events from all running tasks are
-rendered live.
-
-### `sessions/store.py` — SessionStore
-
-A small wrapper that knows the base directory for sessions. Each
-`Task` holds a `Session` whose `metadata["_store_dir"]` is set by the
-store, so the Task can save the session without re-passing the
-directory.
-
-## V1 + V2 modules (unchanged)
+## V1 + V2 + V3 modules (unchanged)
 
 ### `core/errors.py` — typed errors
 
-`HyuskError` is the base. Subclasses: `ToolNotFound`, `PermissionDenied`,
-`CommandFailed`, `Timeout`, `UnsupportedPlatform`, `FileNotFound`,
-`InvalidInput`, `ProviderError`, `AgentLoopLimit`, `AgentCancelled`,
-`AgentSteered`.
+`HyuskError` is the base. Subclasses cover tool, permission, command,
+timeout, platform, file, input, provider, loop limit, cancellation,
+and steering errors.
 
 ### `events/events.py` — typed event bus
 
-`EventBus` is a synchronous pub/sub. `EventType` enum covers what the
-agent and daemon need. V3 does not add new event types; existing ones
-already cover concurrent task flows.
+`EventBus` is a synchronous pub/sub. `EventType` covers what the
+agent and daemon need.
 
 ### `llm/` — providers
 
-`LLMProvider.chat()` is the canonical contract. `chat_stream()` yields
-`LLMChunk(text_delta, tool_call_delta, done, response)` for streaming
-support. V2 added `OpenAICompatProvider.chat_stream()` and the
-`AnthropicProvider`. V3 doesn't change these.
+`LLMProvider.chat()` is the canonical contract. `chat_stream()`
+yields `LLMChunk` for streaming support.
 
 ### `tools/` — tool base + registry
 
 A `Tool` is a data record: name, description, JSON-schema input,
 permission category, `execute()` callable. The agent discovers tools
-through `ToolRegistry`; never hardcoded.
+through `ToolRegistry`; never hardcoded. Plugins register tools
+dynamically via the same registry.
 
 ### `permissions/policy.py`
 
 `PermissionPolicy` produces `allow` / `deny` / `ask` per call. The
 daemon routes `ask` to the originating client.
 
+### `sessions/session.py` + `sessions/store.py`
+
+`Session` is a dataclass. `SessionStore` is a thin wrapper that knows
+the base directory. `Task` calls `session.save_self()` to persist
+its messages after a run completes.
+
 ### `platform/`
 
-OS abstractions: `Shell` (subprocess), `ProcessManager` (Posix +
-Windows stubs), `filesystem` helpers.
+OS abstractions: `Shell`, `ProcessManager` (Posix + Windows stubs),
+`filesystem` helpers.
 
-## V4+ paths (still no rewrite needed)
+## V5+ paths (still no rewrite needed)
 
-| V4+ feature              | Hook                                        |
+| V5+ feature              | Hook                                        |
 |--------------------------|---------------------------------------------|
-| Mobile client            | WebSocket protocol already supports all flows |
-| Voice client             | Same protocol; push transcribed text into `run` |
+| Mobile client            | Already supported by V3 protocol            |
+| Streaming mid-cancel     | Provider-specific mid-stream abort          |
 | Persistent PTY shell     | swap `platform.shell.make_shell` factory    |
 | Real Windows processes   | add `platform/windows/...`                  |
-| Streaming cancellations  | provider-specific mid-stream abort          |
-| Plugin marketplace       | dynamic Tool loading via the registry       |
+| Plugin marketplace       | curated registry of community plugins       |
 | Sandboxing               | wrap `Tool.run` in a sandboxed executor     |
 | Remote daemon            | add auth layer; protocol unchanged          |
 | Multi-tenant daemon      | namespace sessions per client token         |
 
-All of these only add code. Nothing in V1/V2/V3 needs to change.
+All of these only add code. Nothing in V1/V2/V3/V4 needs to change.

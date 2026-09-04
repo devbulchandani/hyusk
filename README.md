@@ -3,51 +3,59 @@
 > A small, clean, extensible foundation for a cross-platform **computer agent**.
 
 Hyusk is a local CLI agent that can run shell commands, read and write files,
-inspect processes, and inspect git repositories — through natural language. V3
-adds **concurrent agent tasks with steering and cancellation** so you can
-fire off a long-running job and keep talking to Hyusk while it works.
+inspect processes, and inspect git repositories — through natural language. V4
+adds **persistent task state**, a **voice client**, **session compaction**, and
+a **plugin system**, so the daemon survives restarts and the agent core can be
+extended without forking the project.
 
 The architecture is modular so future voice clients, phone apps, remote
-clients, and coding-agent integrations can plug into the same core without
+clients, and coding-agent integrations plug into the same core without
 touching it.
 
 ---
 
-## What is new in V3
+## What is new in V4
 
-- **Concurrent agent runs.** Every `run` returns a `task_id` immediately.
-  Multiple tasks execute in parallel. The CLI multiplexes events from all
-  running tasks.
-- **Steering (`steer <id> <message>`).** Inject a follow-up user message
-  into a running task. The agent picks it up between tool calls.
-- **Cancellation (`cancel <id>`).** Stop a running task cleanly. The current
-  tool call finishes, then the agent loop exits.
-- **Background mode (`bg: <prompt>`).** Start a task without waiting for
-  it; keep chatting in the foreground.
-- **ask routing.** The daemon no longer auto-grants destructive tool calls.
-  It forwards `ask` decisions to the client that started the task. The CLI
-  prompts; a future mobile client can implement its own prompt.
-- **60 tests passing**, including concurrent-task and steering coverage.
+- **Persistent task state.** Tasks are written to disk; on restart the
+  daemon marks any that were running as `interrupted` so the user can
+  inspect or discard them.
+- **Session compaction.** `compact_session` asks the LLM to summarize a
+  long session and returns a new (smaller) session id. Keeps the LLM
+  context window manageable.
+- **Voice client.** A standalone `hyusk voice` subcommand that reads
+  from stdin (text mode) or the microphone (with `sounddevice`) and
+  feeds the daemon. The same WebSocket protocol — just a different
+  process.
+- **Plugin discovery.** Drop Python files in `~/.config/hyusk/plugins/`
+  with a `register(registry)` function; the daemon loads them on
+  startup.
+- **Protocol v4 handshake.** `{"type": "version"}` returns the
+  protocol number so clients can adapt.
+- **75 tests passing**, including persistent-task and plugin tests.
 
-## What V1 and V2 already shipped
+## What V1, V2, and V3 already shipped
 
 - Interactive REPL and one-shot commands.
 - OpenAI-compatible and Anthropic providers (both stream SSE).
 - Filesystem, shell, process, and git tools.
 - Pluggable permission policy; destructive tools require confirmation.
 - JSON-persisted sessions that can be resumed.
-- Typed event bus (the same bus is exposed over WebSocket).
+- Typed event bus.
 - Long-running daemon with `start|stop|status` and a pid file.
+- WebSocket protocol with concurrent tasks, steering, cancellation, and
+  ask routing.
 
 ## What is **not** built yet
 
-V3 does **not** ship these — the interfaces are designed so they land
+V4 does **not** ship these — the interfaces are designed so they land
 without rewriting the core:
 
-- Wake-word / voice transcription / text-to-speech.
-- Mobile app, remote control, cloud backend.
+- Voice / mobile / WebSocket clients beyond the standalone `hyusk voice` CLI.
+- Real-time wake-word detection.
+- Cloud backend, multi-tenant daemon.
 - Screen / computer-vision automation.
 - Browser automation, plugin marketplace.
+- Streaming mid-stream cancellation.
 
 ---
 
@@ -75,11 +83,12 @@ uv run hyusk --help
 
 ## Configuration
 
-Loaded from (in order): env vars prefixed with `HYUSK_`, a TOML file in
-the platform user-config dir, then built-in defaults.
+Loaded from (in order): `HYUSK_CONFIG_DIR` (override), env vars prefixed with
+`HYUSK_`, a TOML file in the user-config dir, then built-in defaults.
 
 | Variable                | Purpose                                       |
 |-------------------------|-----------------------------------------------|
+| `HYUSK_CONFIG_DIR`       | Override the user-config dir (for tests).     |
 | `HYUSK_LLM_PROVIDER`    | `openai` (default) or `anthropic`             |
 | `HYUSK_LLM_MODEL`       | model name                                    |
 | `HYUSK_LLM_API_KEY`     | API key                                       |
@@ -91,11 +100,16 @@ the platform user-config dir, then built-in defaults.
 
 API keys are never logged.
 
+User config directory:
+- macOS: `~/Library/Application Support/hyusk/`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/hyusk/`
+- Override with `HYUSK_CONFIG_DIR=...`
+
 ---
 
 ## Usage
 
-### Start the daemon (recommended)
+### Start the daemon
 
 ```bash
 hyusk --daemon-action start
@@ -103,96 +117,100 @@ hyusk --daemon-action status
 hyusk --daemon-action stop
 ```
 
-When the daemon is running, every `hyusk` command — REPL, one-shot, or
-session list — uses it transparently. If not, the CLI starts an in-process
-agent (V1 behavior).
-
-### One-shot
+### One-shot and REPL (V3 features)
 
 ```bash
-hyusk "show me the processes using the most CPU"
 hyusk "what is in README.md?"
-hyusk --no-daemon "..."        # force in-process agent
-hyusk --daemon-only "..."      # fail if daemon is unreachable
+hyusk --daemon-only "..."
+
+# REPL: bg: prompts, steer, cancel, tasks
+hyusk
 ```
 
-### Interactive REPL — concurrent tasks
+### Voice client (V4)
 
 ```bash
-$ hyusk
-hyusk v0.3.0  (connected to daemon at 127.0.0.1:8765)
-(type 'help' for commands)
-hyusk > bg: count files in /usr/local recursively
+# Text mode (stdin → daemon)
+hyusk --voice --text
 
-[abcd1234] started task abcd1234 (session ...)
-hyusk > list the files in this directory instead
-
-[efgh5678] -> list_directory
-   path: .
-   ok (12 ms)
-
-Here are the contents...
-
-hyusk > tasks
-  abcd1234  running  iter=2  'count files in /usr/local recursively'
-  efgh5678  done     iter=1  'list the files in this directory instead'
-
-hyusk > steer abcd1234 skip node_modules
-[abcd1234] [steer] skip node_modules
-
-hyusk > cancel efgh5678
-cancel: efgh5678 ok=True
-
-hyusk > help
-commands:
-  bg: <prompt>            start a background task
-  steer <id> <message>    inject a follow-up message into a running task
-  cancel <id>             cancel a running task
-  tasks                   list tasks (active + recent)
-  session                 show the current session id
-  reset                   next prompt starts a new session
-  tools                   list available tools
-  help                    show this list
-  exit | quit | :q        leave the REPL
+# Mic mode (requires sounddevice + an STT engine; the default is a stub)
+hyusk --voice --mic
 ```
+
+The voice client uses the same WebSocket protocol as the regular CLI. It's a
+demonstration that the V2/V3 protocol works across process boundaries.
+
+### Plugins (V4)
+
+Drop a Python file in `~/.config/hyusk/plugins/`:
+
+```python
+# ~/.config/hyusk/plugins/hello.py
+from hyusk.tools.base import Tool, READ
+
+def register(registry):
+    registry.register(Tool(
+        name="hello",
+        description="Say hello to the given name.",
+        input_schema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        permission=READ,
+        execute=lambda a: {"greeting": f"hello, {a['name']}"},
+    ))
+```
+
+On daemon startup, the file is imported and `register(registry)` is called.
+A broken plugin is logged and skipped — it cannot prevent the daemon from
+starting.
 
 ### Sessions
 
 ```bash
 hyusk --list-sessions
-hyusk --session <id> "..."    # resume
+hyusk --session <id> "..."
 ```
+
+### Sessions (V4: compaction)
+
+When a session grows large, ask the daemon to compact it:
+
+```
+client -> server: {"type": "compact_session", "session_id": "<id>"}
+server -> client: {"type": "compacted", "session_id": "<old>", "new_session_id": "<new>"}
+```
+
+The daemon asks the LLM to summarize the conversation and writes a new
+session that contains the summary.
 
 ---
 
-## Daemon protocol (V3)
+## Daemon protocol (V4)
+
+The V4 protocol is a superset of V3. New messages:
 
 ```text
 client -> server:
-  {"type": "run", "session_id": "<id|new>", "input": "...", "model": "..."}
-  {"type": "list_sessions"}
-  {"type": "list_tasks"}
-  {"type": "cancel", "task_id": "..."}
-  {"type": "steer", "task_id": "...", "input": "..."}
-  {"type": "grant", "ask_id": "...", "granted": bool}
-  {"type": "ping"}
+  {"type": "version"}
+  {"type": "task_detail", "task_id": "..."}
+  {"type": "list_tasks_all"}
+  {"type": "compact_session", "session_id": "..."}
+  {"type": "discard_task", "task_id": "..."}
 
 server -> client:
-  {"type": "task", "task_id": "...", "session_id": "..."}
-  {"type": "event", "task_id": "...", "session_id": "...",
-                 "event": "agent.started|tool.started|...", "data": {...}}
-  {"type": "ask", "ask_id": "...", "task_id": "...", "tool": "...",
-                 "arguments": {...}}
-  {"type": "task_done", "task_id": "...", "state": "done|cancelled|errored",
-                    "iterations": N, "cancelled": bool, "error": "..."}
-  {"type": "error", "message": "..."}
-  {"type": "pong"}
-  {"type": "sessions", "sessions": [...]}
-  {"type": "tasks", "tasks": [...]}
+  {"type": "version", "version": "0.4.0", "protocol": 4}
+  {"type": "task_detail", "task": {...}}
+  {"type": "tasks", "tasks": [...]}                # in response to list_tasks_all
+  {"type": "compacted", "session_id": "...", "new_session_id": "..."}
+  {"type": "discarded", "task_id": "..."}
 ```
 
-Multiple tasks can run at once; every event is tagged with `task_id` so
-the client can multiplex.
+Persistent tasks are written to `<user_config>/hyusk/tasks/<id>.json` so
+they survive daemon restarts. Running tasks at restart are marked
+`interrupted` (the agent thread is gone; the user inspects them with
+`task_detail` and discards or resumes via a new `run`).
 
 ---
 
@@ -211,6 +229,8 @@ the client can multiplex.
 | `git.log`         | READ        | Recent commits.                                      |
 | `git.branch`      | READ        | Current branch.                                      |
 
+User plugins (see above) can add more.
+
 ---
 
 ## Security model
@@ -219,14 +239,9 @@ the client can multiplex.
   `DESTRUCTIVE`).
 - `PermissionPolicy` decides per call: `allow`, `deny`, or `ask`.
 - Destructive tools always require interactive confirmation by default.
-- In non-interactive contexts, `kill_process` is **refused** rather than
-  silently auto-allowed.
-- `--no-confirm` bypasses prompts (still subject to deny rules).
+- The daemon routes `ask` to the connected client. The CLI prompts; a
+  future mobile/voice client implements its own prompt.
 - API keys are scrubbed from logs.
-
-When the daemon is running, the **client that started a task** is the one
-that gets the `ask` message. The CLI prompts; a future mobile/voice
-client implements its own prompt.
 
 ---
 
@@ -247,16 +262,18 @@ hyusk/
 ├── docs/architecture.md
 ├── src/hyusk/
 │   ├── cli/        # argparse, REPL, daemon subcommands
-│   ├── agent/      # agent loop (streaming + steering) and TaskManager
+│   ├── agent/      # loop (streaming + steering), TaskManager, TaskStore
 │   ├── llm/        # provider abstraction + OpenAI-compat + Anthropic
 │   ├── tools/      # tool base + registry + per-tool modules
 │   ├── permissions/# permission policy
 │   ├── sessions/   # session persistence + SessionStore
 │   ├── events/     # event bus
-│   ├── daemon/     # WebSocket server (concurrent tasks V3)
-│   ├── client/     # WebSocket client (V3: submit/cancel/steer/list_tasks)
+│   ├── daemon/     # WebSocket server (V4: persistent tasks, ask routing, plugin loader)
+│   ├── client/     # WebSocket client (V4: version, task_detail, compact_session, …)
 │   ├── platform/   # OS abstractions
-│   ├── config/     # config loader
+│   ├── plugins/    # V4: user plugin discovery
+│   ├── voice/      # V4: standalone voice client
+│   ├── config/     # config loader (V4: HYUSK_CONFIG_DIR)
 │   └── core/       # errors, logging
 └── tests/
 ```
@@ -270,18 +287,24 @@ hyusk/
 ### Adding a new LLM provider
 
 Implement `LLMProvider.chat()` and (optionally) `chat_stream()` in a new
-file under `src/hyusk/llm/`. Then add a branch in
+file under `src/hyusk/llm/`. Add a branch in
 `daemon/registry_builder.py:build_provider()`.
+
+### Writing a plugin
+
+Drop a `.py` file in `~/.config/hyusk/plugins/` with a top-level
+`register(registry)` function. See the example above.
 
 ---
 
-## Roadmap (V4+)
+## Roadmap (V5+)
 
-- Voice / mobile clients (subscribe to the daemon over WebSocket).
+- Mobile client app (iOS/Android) talking to the daemon.
 - Persistent PTY-backed shell sessions.
 - Sandboxed tool execution.
 - Browser automation as a new tool category.
-- Plugin marketplace.
+- Streaming mid-stream cancellation.
+- Plugin marketplace (curated list of community plugins).
 
 See [`docs/architecture.md`](docs/architecture.md).
 
