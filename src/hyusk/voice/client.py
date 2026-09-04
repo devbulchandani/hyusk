@@ -344,14 +344,22 @@ async def _run_mic_mode(
         "Ctrl-D to exit.",
         flush=True,
     )
-    while True:
-        text = await _record_and_transcribe(backend)
-        if not text:
-            continue
-        if text.strip().lower() in ("exit", "quit"):
-            return 0
-        print(f"[voice] heard: {text!r}", file=sys.stderr)
-        await _run_turn(client, text, model, tts_backend)
+    try:
+        while True:
+            text = await _record_and_transcribe(backend)
+            if not text:
+                continue
+            if text.strip().lower() in ("exit", "quit"):
+                return 0
+            print(f"[voice] heard: {text!r}", file=sys.stderr)
+            await _run_turn(client, text, model, tts_backend)
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        # Any error in one turn should not kill the voice client. Log
+        # the error and continue listening.
+        print(f"[voice] turn error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 0
     return 0
 
 
@@ -635,13 +643,24 @@ async def _run_turn(
                     {done_task, press_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+            except asyncio.CancelledError:
+                # The done future was cancelled (e.g. by the daemon
+                # acknowledging our cancel). Treat as interrupted.
+                interrupted[0] = True
+                break
             finally:
                 for t in (done_task, press_task):
                     if not t.done():
                         t.cancel()
 
             if done_task.done():
-                done: TaskDone = done_task.result()
+                try:
+                    done: TaskDone = done_task.result()
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    # Cancelled or already-cleared.
+                    interrupted[0] = True
+                    done = None
+                    break
                 break
 
             # Interrupted. Tell the daemon to stop the task and break
@@ -655,14 +674,22 @@ async def _run_turn(
             # Give the daemon a brief moment to acknowledge.
             try:
                 done = await asyncio.wait_for(done_future, timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 done = None
             break
+    except asyncio.CancelledError:
+        # Outer cancellation (e.g. parent task cancelled). Treat as
+        # interrupted and return to the mic loop.
+        interrupted[0] = True
+        return
     except Exception as exc:
         print(f"\n[error] {type(exc).__name__}: {exc}", file=sys.stderr)
         return
     finally:
-        keypress_handle.stop()
+        try:
+            keypress_handle.stop()
+        except Exception:
+            pass
 
     sys.stdout.write("\n")
     sys.stdout.flush()
