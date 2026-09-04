@@ -14,7 +14,7 @@ touching it.
 
 ---
 
-## What is new in V4
+## What is new in V4 (and V4.1)
 
 - **Persistent task state.** Tasks are written to disk; on restart the
   daemon marks any that were running as `interrupted` so the user can
@@ -29,9 +29,21 @@ touching it.
 - **Plugin discovery.** Drop Python files in `~/.config/hyusk/plugins/`
   with a `register(registry)` function; the daemon loads them on
   startup.
+- **V4.1: `hyusk config` subcommand.** Set the API key, model, provider,
+  and base URL from the CLI — no env vars required. Use any OpenAI-
+  compatible endpoint (OpenRouter, Together, Groq, LM Studio).
+- **V4.1: Per-invocation overrides.** `--provider`, `--model`,
+  `--api-key`, `--base-url` flags override the config for one run.
+- **V4.1: Real TTS.** The voice client speaks replies. Default on
+  macOS is the built-in `say` command. Optional: KittenTTS (local,
+  open-weights), OpenAI TTS (cloud).
+- **V4.1: Real STT.** The voice client's mic mode transcribes via
+  mlx-whisper (Apple Silicon), openai-whisper (other), or the
+  OpenAI Whisper API. Falls back to text mode if none are available.
 - **Protocol v4 handshake.** `{"type": "version"}` returns the
   protocol number so clients can adapt.
-- **75 tests passing**, including persistent-task and plugin tests.
+- **87 tests passing**, including persistent-task, plugin, and TTS
+  backend tests.
 
 ## What V1, V2, and V3 already shipped
 
@@ -103,6 +115,41 @@ API keys are never logged.
 User config directory:
 - macOS: `~/Library/Application Support/hyusk/`
 - Linux: `${XDG_CONFIG_HOME:-~/.config}/hyusk/`
+- Override with `HYUSK_CONFIG_DIR=...`
+
+---
+
+## Set up the API key
+
+No environment variables are required. Use `hyusk config`:
+
+```bash
+# OpenAI
+hyusk config set llm.provider openai
+hyusk config set llm.api_key sk-...
+hyusk config set llm.model gpt-4o-mini
+
+# Anthropic
+hyusk config set llm.provider anthropic
+hyusk config set llm.api_key sk-ant-...
+hyusk config set llm.model claude-3-5-sonnet-latest
+
+# OpenRouter (or any OpenAI-compatible endpoint)
+hyusk config set llm.provider openai
+hyusk config set llm.api_key sk-or-v1-...
+hyusk config set llm.base_url https://openrouter.ai/api/v1
+hyusk config set llm.model anthropic/claude-3.5-sonnet
+
+# Show the active config (api keys masked)
+hyusk config show
+
+# One-off override without changing the saved config
+hyusk --provider anthropic --api-key sk-ant-... --model claude-3-5-sonnet-latest "..."
+```
+
+The config file lives at:
+- macOS: `~/Library/Application Support/hyusk/config.toml`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/hyusk/config.toml`
 - Override with `HYUSK_CONFIG_DIR=...`
 
 ---
