@@ -1,73 +1,78 @@
-"""TTS backend selection tests (V4.1)."""
+"""TTS backend tests (V5: Kokoro, Say, OpenAI, NoOp)."""
 
 from __future__ import annotations
 
 import sys
 
 from hyusk.voice import tts
+from hyusk.voice.tts import (
+    TTSConfig,
+    NoOpBackend,
+    SayBackend,
+    KokoroBackend,
+    OpenAITTSBackend,
+)
 
 
 def test_noop_backend_is_always_available():
-    b = tts.NoOpBackend()
+    b = NoOpBackend()
     assert b.is_available()
     assert b.name() == "none"
-    # speak() should be a no-op (no exception).
     b.speak("hello")
 
 
 def test_say_backend_only_available_on_macos():
-    b = tts.SayBackend()
+    b = SayBackend()
     if sys.platform == "darwin":
-        # On a real Mac with /usr/bin/say, this is available.
-        # We don't assert is_available() strictly because CI may be a stripped image.
         assert b.name() == "say"
     else:
         assert not b.is_available()
 
 
+def test_kokoro_backend_imports_cleanly():
+    b = KokoroBackend()
+    assert b.name() == "kokoro"
+    assert isinstance(b.is_available(), bool)
+
+
+def test_openai_backend_requires_api_key():
+    b = OpenAITTSBackend(voice="alloy")
+    import os
+    has_key = bool(
+        os.environ.get("OPENAI_API_KEY") or os.environ.get("HYUSK_LLM_API_KEY")
+    )
+    assert b.is_available() == has_key
+
+
 def test_select_backend_none():
-    b = tts.select_backend(tts.TTSConfig(backend="none"))
+    b = tts.select_backend(TTSConfig(backend="none"))
     assert b.name() == "none"
     assert b.is_available()
 
 
 def test_select_backend_unknown_falls_back_to_none():
-    b = tts.select_backend(tts.TTSConfig(backend="does-not-exist"))
+    b = tts.select_backend(TTSConfig(backend="does-not-exist"))
     assert b.name() == "none"
 
 
 def test_select_backend_say_respects_platform():
-    b = tts.select_backend(tts.TTSConfig(backend="say"))
+    b = tts.select_backend(TTSConfig(backend="say"))
     if sys.platform == "darwin":
-        # On macOS the backend may or may not be available depending on
-        # whether /usr/bin/say is in PATH (it should be). We just check
-        # the type, not availability, because CI images vary.
         assert b.name() == "say"
     else:
-        # On other platforms, say is unavailable, so we fall back to none.
         assert b.name() == "none"
-
-
-def test_select_backend_kitten_when_unavailable_falls_back():
-    """Without `kittentts` installed, kitten should fall back to none."""
-    b = tts.select_backend(tts.TTSConfig(backend="kitten"))
-    if not b.is_available():
-        assert b.name() == "none"
-    # If it IS available, the name should be "kitten".
 
 
 def test_say_backend_speak_invokes_subprocess(monkeypatch):
-    """The Say backend should call the `say` command with the text."""
     import subprocess
+    calls = []
 
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def fake_run(cmd, *args, **kwargs):
         calls.append(cmd)
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    b = tts.SayBackend(voice="Daniel")
+    b = SayBackend(voice="Daniel")
     b.speak("hello world")
     assert len(calls) == 1
     cmd = calls[0]
@@ -77,87 +82,32 @@ def test_say_backend_speak_invokes_subprocess(monkeypatch):
     assert "hello world" in cmd
 
 
-def test_stt_unavailable_message_suggests_install(capsys, monkeypatch):
-    """If a non-text STT backend is requested but unavailable, the user
-    should see a helpful install hint."""
-    import hyusk.voice.stt as vstt
-
-    class FakeBackend:
-        name = "mlx-whisper"
-        def is_available(self): return False
-        def transcribe(self, p): return ""
-
-    # Pretend mlx-whisper was selected but is not available.
-    monkeypatch.setattr(vstt, "select_backend", lambda name: FakeBackend())
-
-    # We can't easily run the full async mic mode, but we can call
-    # the warning path directly via the function. Instead just check
-    # that the helper logic works: with name="mlx-whisper" and an
-    # unavailable backend, the message includes the install hint.
-    # The actual print happens inside _run_mic_mode; we just verify
-    # the message string is reasonable.
-    msg = (
-        "[voice] STT backend 'mlx-whisper' not installed; falling back to text mode."
-    )
-    assert "mlx-whisper" in msg
-    assert "text mode" in msg
-
-
-def test_kitten_backend_passes_no_args_to_constructor(monkeypatch):
-    """Regression: the KittenTTS constructor takes optional model_path,
-    not a repo ID. Calling it with a repo ID string breaks it. Ensure
-    we call KittenTTS() with no arguments so it auto-downloads.
-    """
-    import hyusk.voice.tts as vts
-
-    captured: dict = {}
-
-    class FakeModel:
-        def generate(self, text, voice="expr-voice-2-m", speed=1.0):
-            return [0.0] * 1000
-
-    class FakeKittenTTS:
-        def __init__(self, *args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            return None
-
-    # Patch the kittentts module import inside the tts module.
-    import sys
-
-    fake_mod = type(sys)("fake_kittentts")
-    fake_mod.KittenTTS = FakeKittenTTS
-    monkeypatch.setitem(sys.modules, "kittentts", fake_mod)
-
-    # Reimport the tts module so it sees the patched kittentts.
-    import importlib
-    importlib.reload(vts)
-    try:
-        b = vts.KittenBackend(voice="expr-voice-2-f")
-        m = b._load()
-        # Verify NO positional or keyword args were passed.
-        assert captured["args"] == (), (
-            f"KittenTTS() must be called with no args; got {captured['args']!r}"
-        )
-        assert captured["kwargs"] == {}, (
-            f"KittenTTS() must be called with no kwargs; got {captured['kwargs']!r}"
-        )
-    finally:
-        # Restore.
-        importlib.reload(vts)
-
-
 def test_say_backend_omits_voice_flag_when_unset(monkeypatch):
-    """If no voice is set, the -v flag should not be passed."""
     import subprocess
+    calls = []
 
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def fake_run(cmd, *args, **kwargs):
         calls.append(cmd)
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    b = tts.SayBackend(voice="")
+    b = SayBackend(voice="")
     b.speak("hi")
     assert calls == [["say", "hi"]]
+
+
+def test_kokoro_config_defaults():
+    b = KokoroBackend()
+    assert b._voice
+    assert b._speed > 0
+
+
+def test_tts_config_dataclass():
+    c = TTSConfig()
+    assert c.backend == ""
+    assert c.voice == ""
+    assert c.speed == 1.0
+    c2 = TTSConfig(backend="kokoro", voice="af_sarah", speed=1.2)
+    assert c2.backend == "kokoro"
+    assert c2.voice == "af_sarah"
+    assert c2.speed == 1.2
