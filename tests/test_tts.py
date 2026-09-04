@@ -103,6 +103,50 @@ def test_stt_unavailable_message_suggests_install(capsys, monkeypatch):
     assert "text mode" in msg
 
 
+def test_kitten_backend_passes_no_args_to_constructor(monkeypatch):
+    """Regression: the KittenTTS constructor takes optional model_path,
+    not a repo ID. Calling it with a repo ID string breaks it. Ensure
+    we call KittenTTS() with no arguments so it auto-downloads.
+    """
+    import hyusk.voice.tts as vts
+
+    captured: dict = {}
+
+    class FakeModel:
+        def generate(self, text, voice="expr-voice-2-m", speed=1.0):
+            return [0.0] * 1000
+
+    class FakeKittenTTS:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return None
+
+    # Patch the kittentts module import inside the tts module.
+    import sys
+
+    fake_mod = type(sys)("fake_kittentts")
+    fake_mod.KittenTTS = FakeKittenTTS
+    monkeypatch.setitem(sys.modules, "kittentts", fake_mod)
+
+    # Reimport the tts module so it sees the patched kittentts.
+    import importlib
+    importlib.reload(vts)
+    try:
+        b = vts.KittenBackend(voice="expr-voice-2-f")
+        m = b._load()
+        # Verify NO positional or keyword args were passed.
+        assert captured["args"] == (), (
+            f"KittenTTS() must be called with no args; got {captured['args']!r}"
+        )
+        assert captured["kwargs"] == {}, (
+            f"KittenTTS() must be called with no kwargs; got {captured['kwargs']!r}"
+        )
+    finally:
+        # Restore.
+        importlib.reload(vts)
+
+
 def test_say_backend_omits_voice_flag_when_unset(monkeypatch):
     """If no voice is set, the -v flag should not be passed."""
     import subprocess
