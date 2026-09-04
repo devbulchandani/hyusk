@@ -186,6 +186,7 @@ class DaemonClient:
         self._on_ask: list[Callable[..., None]] = []
         self._on_done: list[Callable[..., None]] = []
         self._on_error: list[Callable[..., None]] = []
+        self._on_task: list[Callable[..., None]] = []
         self._on_task_list: list[Callable[..., None]] = []
         # Pending futures for one-shot RPCs
         self._pending: dict[str, asyncio.Future] = {}
@@ -376,6 +377,19 @@ class DaemonClient:
 
     def on_error(self, cb: Callable[[str], None]) -> None:
         self._on_error.append(cb)
+
+    def on_task(self, cb: Callable[..., None]) -> None:
+        """Subscribe to "task" messages (sent right after a `run` submit).
+
+        The callback receives the Task dataclass with ``id`` and
+        ``session_id`` attributes.
+        """
+        self._on_task.append(cb)
+        try:
+            while len(self._on_task) > 1:
+                self._on_task.pop()
+        except IndexError:
+            pass
 
     # ---- V4 methods ----
 

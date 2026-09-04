@@ -360,7 +360,7 @@ The voice client transforms agent output before TTS:
 This means the LLM can return markdown or tool traces, and the user
 hears only the human-readable parts.
 
-## Streaming TTS (V5+)
+## Streaming TTS + interrupt (V5+)
 
 Starting with V5, the voice client speaks sentences **as soon as the
 LLM produces them** — it does not wait for the full reply.
@@ -385,6 +385,20 @@ before the LLM finishes writing the rest of the reply.
 Disable streaming with `--tts-backend say` (synth the whole reply
 in one shot) or `--tts-backend none` (silent). OpenAI and Kokoro
 both stream.
+
+### Interrupting the agent
+
+While the agent is generating a reply (or while it is speaking),
+press **Space** to interrupt:
+
+- The current TTS playback is cut off mid-word.
+- The agent task is cancelled on the daemon.
+- The voice client returns to the listening prompt (mic mode) or
+  reads the next stdin line (text mode).
+
+This works on macOS and Linux (the keypress detector uses
+`termios` + `select` to poll stdin without blocking). On Windows it
+falls back to a `msvcrt.kbhit()` polling loop.
 
 ## Available tools
 

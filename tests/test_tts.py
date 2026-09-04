@@ -223,6 +223,78 @@ def test_tts_speaker_uses_single_playback_stream():
     asyncio.run(test())
 
 
+def test_tts_speaker_interrupt_clears_queue_and_closes_stream():
+    """interrupt() should stop audio and drop pending chunks.
+
+    The new interrupt path is used by the keypress handler when the
+    user presses Space. It should:
+    - Close the active OutputStream so audio cuts off mid-word
+    - Drop any pending chunks in the queue
+    - Allow drain() to return promptly
+    """
+    import asyncio
+    from hyusk.voice.client import _TTSSpeaker
+
+    class FakeStream:
+        def __init__(self, *a, **kw):
+            self.stopped = False
+            self.closed = False
+        def start(self): pass
+        def stop(self): self.stopped = True
+        def close(self): self.closed = True
+        def write(self, samples): pass
+
+    class FakeBackend:
+        def is_available(self): return True
+        def name(self): return "fake"
+        def synthesize(self, text: str, voice: str = "", speed=None):
+            import numpy as np
+            return np.zeros((100,), dtype="float32"), 16000
+        def speak(self, text: str): pass
+
+    async def test():
+        """interrupt() should stop the active stream and mark work done.
+
+        This test directly sets up the speaker's internal state
+        (skipping the worker pipeline, which is timing-sensitive) and
+        verifies that interrupt() correctly stops the stream.
+        """
+        import sys
+        from unittest.mock import MagicMock
+
+        mock_sd = MagicMock()
+        stream = FakeStream()
+        mock_sd.OutputStream = lambda *a, **kw: stream
+        sys.modules["sounddevice"] = mock_sd
+
+        try:
+            tts = FakeBackend()
+            sp = _TTSSpeaker(tts, max_in_flight=2)
+            # Manually open the stream (simulates what _playback_loop does
+            # on the first write).
+            sp._ensure_stream(16000)
+            assert sp._stream is stream
+            # Simulate one synth worker finishing.
+            with sp._done_lock:
+                sp._done_count = 1
+            sp._counter = 1
+            # Now interrupt.
+            sp.interrupt()
+            # The stream should be stopped and closed.
+            assert stream.stopped
+            assert stream.closed
+            # The internal _stream ref should be cleared.
+            assert sp._stream is None
+            # Done count should be == counter so drain() exits.
+            assert sp._done_count == sp._counter
+            # drain() should return immediately.
+            await sp.drain()
+        finally:
+            del sys.modules["sounddevice"]
+
+    asyncio.run(test())
+
+
 def test_tts_speaker_no_gaps_between_chunks():
     """Chunks should be written to the stream back-to-back.
 

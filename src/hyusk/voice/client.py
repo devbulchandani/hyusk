@@ -355,6 +355,18 @@ async def _run_mic_mode(
     return 0
 
 
+async def _await_done(done_future: asyncio.Future) -> None:
+    """Await the done future, ignoring its return value (just signaling)."""
+    await done_future
+
+
+async def _await_press(handle) -> None:
+    """Block until the keypress handle reports a press."""
+    loop = asyncio.get_event_loop()
+    while not handle.was_pressed():
+        await asyncio.sleep(0.05)
+
+
 class _TTSSpeaker:
     """Play TTS audio with strict ordering, no gaps.
 
@@ -481,6 +493,38 @@ class _TTSSpeaker:
                 # Out of order; stash and wait.
                 pending[seq] = (samples, sr)
 
+
+    def interrupt(self) -> None:
+        """Cut off any in-flight audio and discard pending chunks.
+
+        Called by the keypress handler when the user presses Space.
+        Closes the OutputStream (so audio cuts off mid-word) and
+        drops any queued chunks. Safe to call multiple times.
+        """
+        with self._stream_lock:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                except Exception:
+                    pass
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+                self._stream_sample_rate = None
+        # Drop pending chunks from the queue.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Exception:
+                break
+        # Mark all in-flight as done so drain() returns.
+        with self._done_lock:
+            self._done_count = self._counter
+        # Wake up the playback thread so it sees the closed stream.
+        self._queue.put(None)
+
     async def drain(self) -> None:
         """Wait until all queued chunks have been written to the stream."""
         # Start the playback thread once.
@@ -517,12 +561,22 @@ class _TTSSpeaker:
 async def _run_turn(
     client: DaemonClient, text: str, model: str | None, tts_backend
 ) -> None:
-    """Submit a single turn; stream the reply as TTS while it generates."""
+    """Submit a single turn; stream the reply as TTS while it generates.
+
+    The user can press Space at any time to interrupt: the agent task
+    is cancelled on the daemon, any queued TTS chunks are discarded,
+    the playback stream is closed, and the function returns so the
+    caller can read the next user input.
+    """
     from . import render
+    from .keypress import install_keypress_handler
 
     final_text_parts: list[str] = []
     tts = _TTSSpeaker(tts_backend) if tts_backend is not None else None
     srenderer = render.StreamingRenderer() if tts is not None else None
+
+    current_task_id: list = [None]  # set by on_task below
+    interrupted: list = [False]      # set by keypress handler
 
     def on_event(ev: EventMessage) -> None:
         if ev.event != "agent.text":
@@ -532,48 +586,99 @@ async def _run_turn(
         if not chunk:
             return
         if data.get("delta"):
-            # Live streaming text: pipe to stdout AND to the TTS renderer.
             sys.stdout.write(chunk)
             sys.stdout.flush()
             if srenderer is not None:
                 for speakable in srenderer.feed(chunk):
-                    if tts is not None:
+                    if tts is not None and not interrupted[0]:
                         tts.submit(speakable)
         else:
-            # Non-streaming fallback (rare): accumulate.
             final_text_parts.append(chunk)
-
-    client.on_event(on_event)
-
-    done_future: asyncio.Future[TaskDone] = asyncio.get_event_loop().create_future()
 
     def on_done(d: TaskDone) -> None:
         if not done_future.done():
             done_future.get_loop().call_soon_threadsafe(done_future.set_result, d)
 
+    def on_task(task_obj) -> None:
+        current_task_id[0] = task_obj.id
+
+    client.on_event(on_event)
     client.on_done(on_done)
+    client.on_task(on_task)
+
+    done_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    def _trigger_interrupt() -> None:
+        interrupted[0] = True
+        tid = current_task_id[0]
+        if tid is not None:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(client.cancel(tid), loop)
+        if tts is not None:
+            tts.interrupt()
+        sys.stderr.write("\n[interrupted]\n")
+        sys.stderr.flush()
+
+    keypress_ctx, keypress_thread, keypress_handle = install_keypress_handler(
+        on_interrupt=_trigger_interrupt, fd=0
+    )
 
     try:
         await client.submit(input_text=text, model=model)
-        done = await asyncio.wait_for(done_future, timeout=600.0)
+
+        # Wait for done OR interrupt.
+        while True:
+            done_task = asyncio.ensure_future(_await_done(done_future))
+            press_task = asyncio.ensure_future(_await_press(keypress_handle))
+            try:
+                done_set, _ = await asyncio.wait(
+                    {done_task, press_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for t in (done_task, press_task):
+                    if not t.done():
+                        t.cancel()
+
+            if done_task.done():
+                done: TaskDone = done_task.result()
+                break
+
+            # Interrupted. Tell the daemon to stop the task and break
+            # out of the wait loop. The TTS was already interrupted
+            # by _trigger_interrupt.
+            if current_task_id[0] is not None:
+                try:
+                    await client.cancel(current_task_id[0])
+                except Exception:
+                    pass
+            # Give the daemon a brief moment to acknowledge.
+            try:
+                done = await asyncio.wait_for(done_future, timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                done = None
+            break
     except Exception as exc:
         print(f"\n[error] {type(exc).__name__}: {exc}", file=sys.stderr)
         return
+    finally:
+        keypress_handle.stop()
 
     sys.stdout.write("\n")
     sys.stdout.flush()
 
-    # Wait for any pending TTS to finish.
-    if tts is not None:
+    if tts is not None and not interrupted[0]:
         await tts.drain()
 
+    if interrupted[0]:
+        return
+    if done is None:
+        return
     if done.error:
         print(f"[error] {done.error}", file=sys.stderr)
     elif done.cancelled:
         print("[cancelled]")
     else:
-        # If we never used the streaming renderer (provider sent only
-        # non-delta text), fall back to a single batched speak.
         if srenderer is None and tts is not None:
             full = "".join(final_text_parts).strip()
             if full:
@@ -581,7 +686,6 @@ async def _run_turn(
                 if speakable:
                     tts.submit(speakable)
                     await tts.drain()
-        # Flush any remaining buffered text from the streaming renderer.
         elif srenderer is not None:
             rest = srenderer.flush()
             if rest and tts is not None:

@@ -114,7 +114,7 @@ class StreamingRenderer:
     falls entirely inside a code block.
     """
 
-    def __init__(self, max_chunk_chars: int = 240) -> None:
+    def __init__(self, max_chunk_chars: int = 120) -> None:
         self._max = max_chunk_chars
         self._buf = ""
         # We track whether we're inside a fenced code block so we can
