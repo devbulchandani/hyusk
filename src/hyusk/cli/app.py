@@ -482,7 +482,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hyusk",
-        description="Cross-platform computer agent (V4: persistent tasks, voice client, daemon, streaming).",
+        description="Cross-platform computer agent (V5: Kokoro TTS, whisper.cpp STT, persistent tasks, daemon).",
     )
     parser.add_argument(
         "prompt",
@@ -518,6 +518,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a voice/text client against the daemon.",
     )
+    parser.add_argument(
+        "--voice-action",
+        choices=["setup", "doctor", "test"],
+        default=None,
+        help="(voice subcommand) run voice setup, doctor, or test.",
+    )
     parser.add_argument("--text", action="store_true", help="(voice) Read input from stdin.")
     parser.add_argument("--mic", action="store_true", help="(voice) Capture from microphone.")
     parser.add_argument("--host", default=None, help="(voice) Daemon host.")
@@ -525,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-tts", action="store_true", help="(voice) Do not use TTS.")
     parser.add_argument(
         "--tts-backend",
-        choices=["say", "kitten", "openai", "none"],
+        choices=["say", "kokoro", "openai", "none"],
         default=None,
         help="(voice) TTS backend for this run.",
     )
@@ -600,8 +606,10 @@ def _normalize_argv(argv: list[str] | None) -> list[str]:
         if action == "unset" and len(rest) >= 1:
             return ["--config-action", "unset", "--config-key", rest[0], *rest[1:]]
         return ["--config-action", action, *rest]
+    if argv[0] == "voice" and len(argv) >= 2 and argv[1] in ("setup", "doctor", "test"):
+        return ["--voice-action", argv[1], *argv[2:]]
     if argv[0] == "voice":
-        return ["--voice", *argv[1:]]
+        return ["--voice"]
     return argv
 
 
@@ -652,6 +660,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown config action: {action}", file=sys.stderr)
         return 2
 
+    if args.voice_action:
+        from ..voice import setup as _voice_setup
+        if args.voice_action == "setup":
+            return _voice_setup.setup()
+        if args.voice_action == "doctor":
+            return _voice_setup.doctor()
+        if args.voice_action == "test":
+            from ..voice import tts as _voice_tts
+            from ..config.config import user_config_dir
+            import tomllib
+            cfg = _voice_tts.TTSConfig()
+            try:
+                p = user_config_dir() / "config.toml"
+                if p.exists():
+                    with p.open("rb") as f:
+                        data = tomllib.load(f).get("voice", {})
+                    cfg.backend = data.get("tts_backend", "")
+                    cfg.voice = data.get("tts_voice", "")
+            except Exception:
+                pass
+            backend = _voice_tts.select_backend(cfg)
+            print(f"Testing TTS backend: {backend.name()}")
+            backend.speak("Hello, this is a test of the Hyusk voice stack.")
+            print("Done.")
+            return 0
     if args.voice:
         from ..voice.client import main as _voice_main
         voice_args: list[str] = []
@@ -671,6 +704,8 @@ def main(argv: list[str] | None = None) -> int:
             voice_args.extend(["--tts-backend", args.tts_backend])
         if args.tts_voice:
             voice_args.extend(["--tts-voice", args.tts_voice])
+        if hasattr(args, "stt_backend") and args.stt_backend:
+            voice_args.extend(["--stt-backend", args.stt_backend])
         return _voice_main(voice_args)
 
     if args.daemon_action:
