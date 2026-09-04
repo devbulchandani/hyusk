@@ -148,6 +148,78 @@ config dir. On macOS and Linux, `XDG_CONFIG_HOME` is also respected
 - `--host` / `--port` override the daemon endpoint.
 - `--no-tts` disables TTS for the reply.
 
+## V5 deltas
+
+### `voice/` — provider-based refactor
+
+The monolithic `voice/tts.py` and `voice/stt.py` were split into provider
+subpackages. The agent core only depends on the `TTSBackend` and
+`STTBackend` Protocols.
+
+```
+voice/
+  audio/         — platform-agnostic mic/speaker abstraction
+  tts/            — TTS providers
+    noop.py
+    say_backend.py
+    kokoro.py
+    openai_tts.py
+  stt/            — STT providers
+    text_backend.py
+    whisper_cpp_stt.py
+    whisper_api.py
+  render.py       — speech renderer (strips markdown/code/JSON)
+  setup.py        — `hyusk voice setup` / `hyusk voice doctor` / `voice test`
+  client.py       — the main entry point
+```
+
+### `voice/tts/kokoro.py` — Kokoro TTS
+
+Local neural TTS via the `kokoro-onnx` package. The model and voices are
+downloaded from `thewh1teagle/kokoro-onnx` GitHub releases on first
+use and cached at `~/.cache/hyusk/kokoro/`. Default voice: `af_sarah`
+(American English female).
+
+### `voice/stt/whisper_cpp_stt.py` — whisper.cpp STT
+
+Local STT via `pywhispercpp` (Python wrapper around whisper.cpp). The
+default model is `base.en` (74 MB). The model is loaded once and
+reused. Configurable via `HYUSK_WHISPER_MODEL` env var or
+`voice.whisper_model` config value.
+
+### `voice/render.py` — speech renderer
+
+Removes markdown, code blocks, JSON blobs, URLs, tool-call lines, and
+list markers from agent output before passing it to TTS. Keeps the
+experience conversational.
+
+### `voice/setup.py` — `hyusk voice setup` / `voice doctor` / `voice test`
+
+- `setup`: print a one-time install guide.
+- `doctor`: check the voice stack (mic, speaker, TTS, STT, models).
+- `test`: synthesize a test phrase using the current TTS.
+
+### `cli/app.py` — `voice` subcommand
+
+::
+
+  hyusk voice setup
+  hyusk voice doctor
+  hyusk voice test
+  hyusk --voice --text          # run the voice client
+  hyusk --voice --mic --tts-backend kokoro --stt-backend whisper_cpp
+
+The `voice.tts_backend` and `voice.stt_backend` config keys select the
+provider. `voice.tts_voice` selects the voice (e.g. `af_sarah`).
+
+### `pyproject.toml` — V5 dependencies
+
+- `voice` extra: `sounddevice`, `numpy`, `scipy`
+- `tts` extra: `kokoro-onnx`, `soundfile`
+- `stt` extra: `pywhispercpp`
+- `tts-cloud` extra: `httpx`
+- `all`: everything
+
 ## V1 + V2 + V3 modules (unchanged)
 
 ### `core/errors.py` — typed errors

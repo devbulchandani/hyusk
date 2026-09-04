@@ -29,20 +29,22 @@ touching it.
 - **Plugin discovery.** Drop Python files in `~/.config/hyusk/plugins/`
   with a `register(registry)` function; the daemon loads them on
   startup.
-- **V4.1: `hyusk config` subcommand.** Set the API key, model, provider,
+- **V5: `hyusk config` subcommand.** Set the API key, model, provider,
   and base URL from the CLI — no env vars required. Use any OpenAI-
   compatible endpoint (OpenRouter, Together, Groq, LM Studio).
-- **V4.1: Per-invocation overrides.** `--provider`, `--model`,
+- **V5: Per-invocation overrides.** `--provider`, `--model`,
   `--api-key`, `--base-url` flags override the config for one run.
-- **V4.1: Real TTS.** The voice client speaks replies. Default on
-  macOS is the built-in `say` command. Optional: KittenTTS (local,
+- **V5: Real TTS.** The voice client speaks replies. Default on
+  macOS is the built-in `say` command. Optional: Kokoro (local,
   open-weights), OpenAI TTS (cloud).
-- **V4.1: Real STT.** The voice client's mic mode transcribes via
-  mlx-whisper (Apple Silicon), openai-whisper (other), or the
-  OpenAI Whisper API. Falls back to text mode if none are available.
+- **V5: Local STT.** The voice client's mic mode transcribes via
+  **whisper.cpp** (via `pywhispercpp`), running locally. Default
+  model is `base.en` (74M, English, fast). Falls back to the OpenAI
+  Whisper API if configured. Falls back to text mode if neither is
+  available.
 - **Protocol v4 handshake.** `{"type": "version"}` returns the
   protocol number so clients can adapt.
-- **87 tests passing**, including persistent-task, plugin, and TTS
+- **80 tests passing**, including persistent-task, plugin, and TTS
   backend tests.
 
 ## What V1, V2, and V3 already shipped
@@ -260,6 +262,103 @@ they survive daemon restarts. Running tasks at restart are marked
 `task_detail` and discards or resumes via a new `run`).
 
 ---
+
+## Voice setup (V5)
+
+The voice client uses **Kokoro** for local TTS and **whisper.cpp** for
+local STT. Both run on CPU and require no cloud API.
+
+### One-time install
+
+```bash
+# All voice deps in one shot
+uv pip install sounddevice numpy scipy kokoro-onnx pywhispercpp soundfile
+
+# (macOS only) the espeak phoneme engine that Kokoro needs
+brew install espeak
+```
+
+### Set your backend choices
+
+```bash
+hyusk config set voice.tts_backend   kokoro
+hyusk config set voice.stt_backend   whisper_cpp
+hyusk config set voice.tts_voice     af_sarah   # see Kokoro voice list
+```
+
+### Verify
+
+```bash
+hyusk voice doctor    # check everything is wired
+hyusk voice test      # say a test phrase
+```
+
+### Run
+
+```bash
+hyusk --voice --text    # type, press Enter
+hyusk --voice --mic     # speak, auto-stops when you pause
+```
+
+### Model files
+
+Both models are downloaded automatically on first use to
+`~/.cache/hyusk/kokoro/` (Kokoro, ~325 MB) and the whisper.cpp
+default location (~75 MB for `base.en`). Set custom paths in
+`~/.config/hyusk/config.toml`:
+
+```toml
+[voice]
+tts_backend = "kokoro"
+kokoro_model  = "/path/to/kokoro-v1.0.onnx"
+kokoro_voices = "/path/to/voices-v1.0.bin"
+stt_backend   = "whisper_cpp"
+whisper_model = "tiny"   # or base, small, medium, large-v3
+```
+
+Set `HYUSK_WHISPER_MODEL` env var to override the Whisper model at
+runtime. Reasonable choices:
+
+| Model     | Size  | Use case                                        |
+|-----------|-------|-------------------------------------------------|
+| `tiny`    | 39 MB | Fastest; lower accuracy                        |
+| `tiny.en` | 39 MB | English-only; fastest with reasonable accuracy  |
+| `base`    | 74 MB | **Default**. Balanced for conversation         |
+| `base.en` | 74 MB | English-only; recommended for Hyusk            |
+| `small`   | 244 MB| More accurate; slower                            |
+| `small.en`| 244 MB| English-only; more accurate                     |
+| `medium`  | 769 MB| Slow; very accurate                              |
+
+### Voice options
+
+Kokoro supports a wide range of voices. Set with
+`hyusk config set voice.tts_voice <name>`:
+
+- English (US): `af_sarah`, `af_bella`, `af_heart`, `af_nicole`, `af_sky`, `af_nova`, `af_river`, `af_jessica`, `af_kore`, `af_aoede`, `af_alloy`
+- English (UK): `bf_emma`, `bf_alice`, `bf_isabella`, `bf_lily`
+- Mandarin: `zf_xiaobei`, `zf_xiaoni`, `zf_xiaoxiao`, `zf_xiaoyi`
+- Spanish: `ef_dora`
+- French: `ff_siwis`
+- Hindi: `hf_alpha`, `hf_beta`
+- Italian: `if_sara`
+- Japanese: `jf_alpha`, `jf_gongitsune`, `jf_nezumi`, `jf_tebukuro`
+- Portuguese: `pf_dora`
+
+### Speech renderer
+
+The voice client transforms agent output before TTS:
+
+- Strips fenced code blocks (``` ... ```)
+- Strips inline code (`...`)
+- Strips markdown links but keeps the link text
+- Strips bare URLs
+- Strips JSON blobs
+- Strips tool-call lines (`Tool call: ...`, `Tool result: ...`)
+- Strips list markers (`-`, `*`, `+`)
+- Collapses whitespace
+
+This means the LLM can return markdown or tool traces, and the user
+hears only the human-readable parts.
 
 ## Available tools
 
