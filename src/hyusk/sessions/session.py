@@ -48,6 +48,13 @@ class Session:
             messages=[_dict_to_msg(d) for d in data.get("messages", [])],
         )
 
+    def save_self(self) -> Path | None:
+        """Save using the base directory stored in metadata (if any)."""
+        d = self.metadata.get("_store_dir")
+        if not d:
+            return None
+        return self.save(d)
+
     def save(self, base_dir: str) -> Path:
         p = Path(base_dir)
         p.mkdir(parents=True, exist_ok=True)
