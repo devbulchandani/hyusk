@@ -45,6 +45,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 
 from ..client.client import DaemonClient, EventMessage, TaskDone
@@ -355,11 +356,15 @@ async def _run_mic_mode(
 
 
 class _TTSSpeaker:
-    """Play TTS audio in a background thread, preserving order.
+    """Play TTS audio with strict ordering, no gaps.
 
-    Synthesis can be slow (Kokoro is ~1-2s per sentence). To keep the
-    conversation feeling snappy, we synthesize the *next* sentence
-    while the *current* one is being played.
+    Design: a SINGLE playback thread consumes chunks from a queue
+    in order and writes them to one persistent
+    ``sounddevice.OutputStream``. Multiple synth workers run in
+    parallel and push into the queue, so synthesis overlaps with
+    playback. Because there is exactly one playback thread writing
+    to one stream, there are no gaps between sentences (a common
+    bug with multi-thread ``sd.play()``/``sd.wait()``).
 
     Usage::
 
@@ -370,19 +375,25 @@ class _TTSSpeaker:
     """
 
     def __init__(self, tts_backend, max_in_flight: int = 2) -> None:
-        # `threading` is imported at module level.
+        import queue as _q
 
         self._backend = tts_backend
         self._max = max(1, max_in_flight)
         self._lock = threading.Lock()
+        # Total chunks submitted (used as a sequence id, and for drain).
         self._counter = 0
-        # In-order playback: worker pops by sequence number.
-        self._next_seq = 0
-        self._ready = threading.Event()
-        self._results: dict[int, str | None] = {}
-        self._results_lock = threading.Lock()
-        self._idle = threading.Event()
-        self._idle.set()
+        # Number of synth workers that have finished (success or fail).
+        self._done_count = 0
+        self._done_lock = threading.Lock()
+        # FIFO queue of (seq, samples, sample_rate) from synth workers.
+        # Sentinel ``None`` means a worker finished (for capacity tracking).
+        self._queue: "queue.Queue" = _q.Queue()
+        # OutputStream (single, lazily created).
+        self._stream = None
+        self._stream_sample_rate = None
+        self._stream_lock = threading.Lock()
+        # Whether the playback thread has been started.
+        self._started = False
 
     def submit(self, text: str) -> None:
         """Queue a chunk for synthesis + playback. Returns immediately."""
@@ -391,20 +402,38 @@ class _TTSSpeaker:
         with self._lock:
             seq = self._counter
             self._counter += 1
-            self._idle.clear()
-        t = threading.Thread(
+        # Bound concurrency: don't start more than max_in_flight workers.
+        self._wait_for_capacity()
+        threading.Thread(
             target=self._worker, args=(seq, text), daemon=True
-        )
-        t.start()
+        ).start()
 
-    async def drain(self) -> None:
-        """Wait until all queued chunks have been played."""
-        # Poll at a fine interval; the actual playback uses sd.wait()
-        # which is blocking, so a small poll is fine.
-        while not self._idle.is_set():
-            await asyncio.sleep(0.01)
+    def _wait_for_capacity(self) -> None:
+        while True:
+            with self._done_lock:
+                in_flight = self._counter - self._done_count
+            if in_flight < self._max:
+                return
+            time.sleep(0.001)
 
-    # -- internals --
+    def _ensure_stream(self, sample_rate: int) -> None:
+        """Open a single persistent OutputStream at the given sample rate."""
+        with self._stream_lock:
+            if self._stream is not None and sample_rate != self._stream_sample_rate:
+                # Sample rate changed; close and reopen.
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            if self._stream is None:
+                import sounddevice as sd
+                self._stream = sd.OutputStream(
+                    samplerate=sample_rate, channels=1, dtype="float32"
+                )
+                self._stream.start()
+                self._stream_sample_rate = sample_rate
 
     def _worker(self, seq: int, text: str) -> None:
         try:
@@ -412,49 +441,79 @@ class _TTSSpeaker:
         except Exception as exc:
             logger = __import__("logging").getLogger("hyusk.voice.tts")
             logger.warning("synthesis failed for chunk %d: %s", seq, exc)
-            with self._results_lock:
-                self._results[seq] = None
-            self._ready.set()
+            with self._done_lock:
+                self._done_count += 1
+            self._queue.put(None)
             return
-        with self._results_lock:
-            self._results[seq] = (samples, sr)
-        self._ready.set()
-        # Play in order: wait for our turn.
+        self._queue.put((seq, samples, sr))
+        with self._done_lock:
+            self._done_count += 1
+
+    def _playback_loop(self) -> None:
+        """Drain the queue in order; write each chunk to the output stream."""
+        expected_seq = 0
+        pending: dict = {}
         while True:
-            with self._results_lock:
-                head = self._next_seq
-                payload = self._results.get(head)
-                if payload is None and head in self._results:
-                    # Previous chunk failed; skip it.
-                    del self._results[head]
-                    self._next_seq = head + 1
-                    continue
-                if head != seq:
-                    # Not our turn; wait.
-                    pass
-                else:
-                    break
-            if head == seq:
+            # If next seq is already in pending, play it.
+            if expected_seq in pending:
+                samples, sr = pending.pop(expected_seq)
+                self._ensure_stream(sr)
+                with self._stream_lock:
+                    self._stream.write(samples)
+                expected_seq += 1
+                continue
+            # Otherwise wait for the next chunk from the queue.
+            try:
+                item = self._queue.get(timeout=0.05)
+            except Exception:
+                continue
+            if item is None:
+                # Worker finished; loop again to drain any pending
+                # items that just arrived.
+                continue
+            seq, samples, sr = item
+            if seq == expected_seq:
+                self._ensure_stream(sr)
+                with self._stream_lock:
+                    self._stream.write(samples)
+                expected_seq += 1
+            else:
+                # Out of order; stash and wait.
+                pending[seq] = (samples, sr)
+
+    async def drain(self) -> None:
+        """Wait until all queued chunks have been written to the stream."""
+        # Start the playback thread once.
+        if not self._started:
+            self._started = True
+            threading.Thread(
+                target=self._playback_loop, daemon=True
+            ).start()
+        # Wait for all synth workers to finish.
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            with self._lock:
+                total = self._counter
+            with self._done_lock:
+                done = self._done_count
+            if done >= total:
                 break
-            self._ready.wait(timeout=0.1)
-        # Play it.
-        try:
-            import sounddevice as sd
-            sd.play(payload[0], samplerate=payload[1])
-            sd.wait()
-        except Exception as exc:
-            logger = __import__("logging").getLogger("hyusk.voice.tts")
-            logger.warning("playback failed for chunk %d: %s", seq, exc)
-        with self._results_lock:
-            self._results.pop(seq, None)
-            self._next_seq = seq + 1
-        self._ready.notify_all() if hasattr(self._ready, "notify_all") else self._ready.set()
-        # If we're the last one, mark idle.
-        with self._lock:
-            if self._next_seq >= self._counter:
-                self._idle.set()
-
-
+            await asyncio.sleep(0.01)
+        # Give the playback thread time to drain pending chunks.
+        # We poll the queue size until it's empty (with a small grace
+        # period for the last write() to complete).
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not self._queue.empty():
+            await asyncio.sleep(0.02)
+        # Close the stream so subsequent sd.play() calls don't conflict.
+        with self._stream_lock:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
 async def _run_turn(
     client: DaemonClient, text: str, model: str | None, tts_backend
 ) -> None:

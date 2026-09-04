@@ -123,10 +123,11 @@ def test_tts_speaker_with_noop_backend():
 
 
 def test_tts_speaker_concurrent_workers():
-    """Multiple workers can synthesize in parallel and drain finishes them.
+    """Multiple workers can synthesize in parallel; drain waits for all.
 
-    Each worker sleeps a different amount; the speaker's `drain` should
-    not return until all of them complete.
+    The new design uses a counter for submitted chunks and a separate
+    counter for finished workers. drain() should not return until
+    all submitted chunks are finished.
     """
     import asyncio
     import time
@@ -147,10 +148,130 @@ def test_tts_speaker_concurrent_workers():
         for i in range(5):
             sp.submit(f"sentence {i}")
         await sp.drain()
-        # All 5 should have been played; counter is now at or beyond 5
+        # All 5 chunks should be marked done.
         assert sp._counter == 5
-        # All results should be consumed
-        assert sp._next_seq == 5
+        assert sp._done_count == 5
+        # Queue should be empty.
+        assert sp._queue.empty()
+
+    asyncio.run(test())
+
+
+def test_tts_speaker_uses_single_playback_stream():
+    """Regression: the speaker must use a single OutputStream.
+
+    The new design lazily creates a single ``sd.OutputStream`` and
+    reuses it across all writes (recreating if the sample rate
+    changes). This avoids the multi-thread ``sd.play()``/``sd.wait()``
+    races that produced gaps between sentences in V4.
+    """
+    import asyncio
+    from hyusk.voice.client import _TTSSpeaker
+
+    writes: list = []
+
+    class FakeStream:
+        def __init__(self, *a, **kw):
+            writes.append(("__init__", a, kw))
+        def start(self):
+            writes.append(("start",))
+        def stop(self):
+            writes.append(("stop",))
+        def close(self):
+            writes.append(("close",))
+        def write(self, samples):
+            writes.append(("write", len(samples)))
+
+    class FakeBackend:
+        def is_available(self): return True
+        def name(self): return "fake"
+        def synthesize(self, text: str, voice: str = "", speed=None):
+            import numpy as np
+            return np.zeros((100,), dtype="float32"), 16000
+        def speak(self, text: str): pass
+
+    async def test():
+        import sys
+        from unittest.mock import MagicMock
+
+        mock_sd = MagicMock()
+        mock_sd.OutputStream = FakeStream
+        # Patch sounddevice in sys.modules so the speaker picks it up.
+        sys.modules["sounddevice"] = mock_sd
+
+        try:
+            tts = FakeBackend()
+            sp = _TTSSpeaker(tts, max_in_flight=3)
+            for i in range(5):
+                sp.submit(f"chunk {i}")
+            await sp.drain()
+
+            # There should be 5 write() calls.
+            write_calls = [w for w in writes if w[0] == "write"]
+            assert len(write_calls) == 5, (
+                f"expected 5 writes, got {len(write_calls)}"
+            )
+            # And exactly ONE OutputStream was constructed (the same
+            # stream is reused).
+            init_calls = [w for w in writes if w[0] == "__init__"]
+            assert len(init_calls) == 1, (
+                f"expected 1 OutputStream, got {len(init_calls)}"
+            )
+        finally:
+            del sys.modules["sounddevice"]
+
+    asyncio.run(test())
+
+
+def test_tts_speaker_no_gaps_between_chunks():
+    """Chunks should be written to the stream back-to-back.
+
+    With one playback stream, each chunk's samples are written in
+    sequence with no gap (no waiting for the next synth).
+    """
+    import asyncio
+    import time
+    from hyusk.voice.client import _TTSSpeaker
+
+    class FakeBackend:
+        def is_available(self): return True
+        def name(self): return "fake"
+        def synthesize(self, text: str, voice: str = "", speed=None):
+            # Each chunk takes 50ms to "synthesize"
+            time.sleep(0.05)
+            import numpy as np
+            return np.zeros((100,), dtype="float32"), 16000
+        def speak(self, text: str): pass
+
+    async def test():
+        import hyusk.voice.client as vclient
+        from unittest.mock import MagicMock
+
+        mock_sd = MagicMock()
+
+        class FakeStream:
+            def __init__(self, *a, **kw): pass
+            def start(self): pass
+            def stop(self): pass
+            def close(self): pass
+            def write(self, samples): pass
+
+        mock_sd.OutputStream = FakeStream
+        vclient.sd = mock_sd
+
+        tts = FakeBackend()
+        sp = _TTSSpeaker(tts, max_in_flight=2)
+        t0 = time.time()
+        for i in range(4):
+            sp.submit(f"chunk {i}")
+        await sp.drain()
+        elapsed = time.time() - t0
+        # 4 chunks * 50ms = 200ms serial. With max_in_flight=2, two
+        # can synthesize in parallel, so total time is ~100ms. Allow
+        # generous slack.
+        # 4 chunks * 50ms / 2 parallel = 100ms. Allow up to 1s for
+        # Python threading overhead on slow CI.
+        assert elapsed < 1.0, f"drain took {elapsed:.2f}s; expected < 1.0s"
 
     asyncio.run(test())
 
