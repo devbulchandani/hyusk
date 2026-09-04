@@ -16,5 +16,9 @@ class NoOpBackend:
         return "none"
 
     def speak(self, text: str) -> None:  # noqa: ARG002
-        # Print is already done by the caller; this is a no-op.
         return
+
+    def synthesize(self, text: str, voice: str = "", speed=None):  # noqa: ARG002
+        """Return an empty audio buffer (no sound)."""
+        import numpy as np
+        return np.zeros((0,), dtype="float32"), 24000

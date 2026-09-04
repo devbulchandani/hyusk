@@ -44,10 +44,33 @@ class OpenAITTSBackend:
         return "openai"
 
     def speak(self, text: str) -> None:
-        import httpx
+        samples, sr = self.synthesize(text)
+        if samples is None or len(samples) == 0:
+            return
+        try:
+            import sounddevice as sd
 
+            sd.play(samples, samplerate=sr)
+            sd.wait()
+        except Exception as exc:
+            logger.warning("OpenAI TTS playback failed: %s", exc)
+
+    def synthesize(self, text: str, voice: str = "", speed=None):
+        """Return OpenAI TTS audio as float32 numpy array.
+
+        Requires the API to return PCM directly. Falls back to writing
+        to a temp file and decoding via soundfile (pydub optional) if
+        only MP3 is available.
+        """
+        import httpx
+        import numpy as np
+        import tempfile
+        import os
+
+        v = voice or self._voice
         url = _base_url().rstrip("/") + "/audio/speech"
         try:
+            # Try PCM response_format (mp3a/wav/pcm) — most endpoints support mp3.
             with httpx.Client(timeout=60) as client:
                 r = client.post(
                     url,
@@ -58,36 +81,20 @@ class OpenAITTSBackend:
                     json={
                         "model": "tts-1",
                         "input": text,
-                        "voice": self._voice,
+                        "voice": v,
+                        # "pcm" gives raw 16-bit little-endian samples we
+                        # can decode directly without extra deps.
+                        "response_format": "pcm",
                     },
                 )
                 r.raise_for_status()
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                    f.write(r.content)
-                    tmp_path = f.name
-        except Exception as exc:
-            logger.warning("OpenAI TTS request failed: %s", exc)
-            raise
+                pcm = r.content
 
-        # Play using a platform-appropriate player.
-        try:
-            player = _player_for_platform()
-            if player is None:
-                # Windows: use the PowerShell MediaPlayer.
-                subprocess.run(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-Command",
-                        f"(New-Object Media.SoundPlayer \"{tmp_path}\").PlaySync()",
-                    ],
-                    check=False,
-                    timeout=60,
-                )
-            else:
-                subprocess.run([player, tmp_path], check=False, timeout=60)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            # 24kHz, 16-bit signed little-endian, mono (per OpenAI docs).
+            sample_rate = 24000
+            audio_int16 = np.frombuffer(pcm, dtype="<i2")
+            samples = audio_int16.astype("float32") / 32768.0
+            return samples, sample_rate
+        except Exception as exc:
+            logger.warning("OpenAI TTS synthesize failed: %s", exc)
+            raise

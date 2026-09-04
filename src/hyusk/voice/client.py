@@ -24,14 +24,14 @@ Configuration
 -------------
 
   [voice]
-  tts_backend = "say" | "kitten" | "openai" | "none"  (default: say on macOS)
+  tts_backend = "say" | "kokoro" | "openai" | "none"  (default: say on macOS)
   tts_voice   = "<backend-specific voice name>"
   stt_backend = "mlx-whisper" | "openai-whisper" | "whisper-api" | "text"
 
 Optional dependencies (install via `uv sync --extra voice`):
 
   sounddevice         microphone recording + audio playback
-  kittentts           local neural TTS
+  kokoro-onnx         local neural TTS (recommended)
   mlx-whisper         local Whisper on Apple Silicon
   openai-whisper      cross-platform local Whisper
   openai              OpenAI TTS / Whisper API
@@ -44,6 +44,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 from typing import Any
 
 from ..client.client import DaemonClient, EventMessage, TaskDone
@@ -353,20 +354,135 @@ async def _run_mic_mode(
     return 0
 
 
+class _TTSSpeaker:
+    """Play TTS audio in a background thread, preserving order.
+
+    Synthesis can be slow (Kokoro is ~1-2s per sentence). To keep the
+    conversation feeling snappy, we synthesize the *next* sentence
+    while the *current* one is being played.
+
+    Usage::
+
+        speaker = _TTSSpeaker(tts_backend, max_in_flight=2)
+        speaker.submit("First sentence.")
+        speaker.submit("Second sentence.")
+        await speaker.drain()  # wait for both to finish
+    """
+
+    def __init__(self, tts_backend, max_in_flight: int = 2) -> None:
+        # `threading` is imported at module level.
+
+        self._backend = tts_backend
+        self._max = max(1, max_in_flight)
+        self._lock = threading.Lock()
+        self._counter = 0
+        # In-order playback: worker pops by sequence number.
+        self._next_seq = 0
+        self._ready = threading.Event()
+        self._results: dict[int, str | None] = {}
+        self._results_lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def submit(self, text: str) -> None:
+        """Queue a chunk for synthesis + playback. Returns immediately."""
+        if not text.strip():
+            return
+        with self._lock:
+            seq = self._counter
+            self._counter += 1
+            self._idle.clear()
+        t = threading.Thread(
+            target=self._worker, args=(seq, text), daemon=True
+        )
+        t.start()
+
+    async def drain(self) -> None:
+        """Wait until all queued chunks have been played."""
+        # Poll at a fine interval; the actual playback uses sd.wait()
+        # which is blocking, so a small poll is fine.
+        while not self._idle.is_set():
+            await asyncio.sleep(0.01)
+
+    # -- internals --
+
+    def _worker(self, seq: int, text: str) -> None:
+        try:
+            samples, sr = self._backend.synthesize(text)
+        except Exception as exc:
+            logger = __import__("logging").getLogger("hyusk.voice.tts")
+            logger.warning("synthesis failed for chunk %d: %s", seq, exc)
+            with self._results_lock:
+                self._results[seq] = None
+            self._ready.set()
+            return
+        with self._results_lock:
+            self._results[seq] = (samples, sr)
+        self._ready.set()
+        # Play in order: wait for our turn.
+        while True:
+            with self._results_lock:
+                head = self._next_seq
+                payload = self._results.get(head)
+                if payload is None and head in self._results:
+                    # Previous chunk failed; skip it.
+                    del self._results[head]
+                    self._next_seq = head + 1
+                    continue
+                if head != seq:
+                    # Not our turn; wait.
+                    pass
+                else:
+                    break
+            if head == seq:
+                break
+            self._ready.wait(timeout=0.1)
+        # Play it.
+        try:
+            import sounddevice as sd
+            sd.play(payload[0], samplerate=payload[1])
+            sd.wait()
+        except Exception as exc:
+            logger = __import__("logging").getLogger("hyusk.voice.tts")
+            logger.warning("playback failed for chunk %d: %s", seq, exc)
+        with self._results_lock:
+            self._results.pop(seq, None)
+            self._next_seq = seq + 1
+        self._ready.notify_all() if hasattr(self._ready, "notify_all") else self._ready.set()
+        # If we're the last one, mark idle.
+        with self._lock:
+            if self._next_seq >= self._counter:
+                self._idle.set()
+
+
 async def _run_turn(
     client: DaemonClient, text: str, model: str | None, tts_backend
 ) -> None:
-    """Submit a single turn, render the reply, optionally speak it."""
+    """Submit a single turn; stream the reply as TTS while it generates."""
+    from . import render
+
     final_text_parts: list[str] = []
+    tts = _TTSSpeaker(tts_backend) if tts_backend is not None else None
+    srenderer = render.StreamingRenderer() if tts is not None else None
 
     def on_event(ev: EventMessage) -> None:
-        if ev.event == "agent.text":
-            data = ev.data or {}
-            chunk = data.get("text", "")
-            if data.get("delta"):
-                final_text_parts.append(chunk)
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
+        if ev.event != "agent.text":
+            return
+        data = ev.data or {}
+        chunk = data.get("text", "")
+        if not chunk:
+            return
+        if data.get("delta"):
+            # Live streaming text: pipe to stdout AND to the TTS renderer.
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            if srenderer is not None:
+                for speakable in srenderer.feed(chunk):
+                    if tts is not None:
+                        tts.submit(speakable)
+        else:
+            # Non-streaming fallback (rare): accumulate.
+            final_text_parts.append(chunk)
 
     client.on_event(on_event)
 
@@ -387,14 +503,33 @@ async def _run_turn(
 
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+    # Wait for any pending TTS to finish.
+    if tts is not None:
+        await tts.drain()
+
     if done.error:
         print(f"[error] {done.error}", file=sys.stderr)
     elif done.cancelled:
         print("[cancelled]")
     else:
-        full = "".join(final_text_parts).strip()
-        if full and tts_backend is not None:
-            tts_backend.speak(full)
+        # If we never used the streaming renderer (provider sent only
+        # non-delta text), fall back to a single batched speak.
+        if srenderer is None and tts is not None:
+            full = "".join(final_text_parts).strip()
+            if full:
+                speakable = render.render_for_speech(full)
+                if speakable:
+                    tts.submit(speakable)
+                    await tts.drain()
+        # Flush any remaining buffered text from the streaming renderer.
+        elif srenderer is not None:
+            rest = srenderer.flush()
+            if rest and tts is not None:
+                speakable = render.render_for_speech(rest)
+                if speakable:
+                    tts.submit(speakable)
+                    await tts.drain()
         print(f"[done in {done.iterations} iteration(s)]")
 
 
@@ -420,7 +555,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--tts-backend",
-        choices=["say", "kitten", "openai", "none"],
+        choices=["say", "kokoro", "openai", "none"],
         default=None,
         help="Override the TTS backend for this run.",
     )

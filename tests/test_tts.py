@@ -102,6 +102,59 @@ def test_kokoro_config_defaults():
     assert b._speed > 0
 
 
+def test_tts_speaker_with_noop_backend():
+    """The _TTSSpeaker should work with any backend that has synthesize().
+
+    With NoOp, synthesize returns an empty array, so the speaker should
+    complete quickly without errors.
+    """
+    import asyncio
+    from hyusk.voice.client import _TTSSpeaker
+    from hyusk.voice.tts.noop import NoOpBackend
+
+    async def test():
+        tts = NoOpBackend()
+        sp = _TTSSpeaker(tts, max_in_flight=2)
+        for text in ["First.", "Second.", "Third."]:
+            sp.submit(text)
+        await sp.drain()
+
+    asyncio.run(test())
+
+
+def test_tts_speaker_concurrent_workers():
+    """Multiple workers can synthesize in parallel and drain finishes them.
+
+    Each worker sleeps a different amount; the speaker's `drain` should
+    not return until all of them complete.
+    """
+    import asyncio
+    import time
+    from hyusk.voice.client import _TTSSpeaker
+
+    class FakeBackend:
+        def is_available(self): return True
+        def name(self): return "fake"
+        def synthesize(self, text: str, voice: str = "", speed=None):
+            time.sleep(0.1)
+            import numpy as np
+            return np.zeros((100,), dtype="float32"), 16000
+        def speak(self, text: str): pass
+
+    async def test():
+        tts = FakeBackend()
+        sp = _TTSSpeaker(tts, max_in_flight=3)
+        for i in range(5):
+            sp.submit(f"sentence {i}")
+        await sp.drain()
+        # All 5 should have been played; counter is now at or beyond 5
+        assert sp._counter == 5
+        # All results should be consumed
+        assert sp._next_seq == 5
+
+    asyncio.run(test())
+
+
 def test_tts_config_dataclass():
     c = TTSConfig()
     assert c.backend == ""
