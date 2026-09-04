@@ -523,16 +523,85 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=None, help="(voice) Daemon host.")
     parser.add_argument("--port", type=int, default=None, help="(voice) Daemon port.")
     parser.add_argument("--no-tts", action="store_true", help="(voice) Do not use TTS.")
+    parser.add_argument(
+        "--tts-backend",
+        choices=["say", "kitten", "openai", "none"],
+        default=None,
+        help="(voice) TTS backend for this run.",
+    )
+    parser.add_argument(
+        "--tts-voice",
+        default=None,
+        help="(voice) TTS voice for this run.",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="Override LLM provider for this run (openai, anthropic).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Override LLM API key for this run (not saved).",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Override LLM base URL (for OpenAI-compatible endpoints like OpenRouter).",
+    )
+    parser.add_argument(
+        "--config-action",
+        choices=["show", "path", "set", "unset"],
+        default=None,
+        help="Manage the persistent config (show|path|set|unset).",
+    )
+    parser.add_argument(
+        "--config-key",
+        default=None,
+        help="(config) dotted key, e.g. llm.api_key.",
+    )
+    parser.add_argument(
+        "--config-value",
+        default=None,
+        help="(config) value to set.",
+    )
     return parser
 
 
 def _normalize_argv(argv: list[str] | None) -> list[str]:
+    """Translate legacy subcommand syntax into flag form.
+
+    Examples:
+      hyusk daemon start        -> --daemon-action start
+      hyusk sessions            -> --list-sessions
+      hyusk config show         -> --config-action show
+      hyusk config set X Y      -> --config-action set --config-key X --config-value Y
+      hyusk config unset X      -> --config-action unset --config-key X
+      hyusk voice --text        -> --voice --text (the rest is passed through)
+    """
     if argv is None:
         return []
-    if argv and argv[0] == "daemon" and len(argv) >= 2 and argv[1] in ("start", "stop", "status"):
+    if not argv:
+        return argv
+    if argv[0] == "daemon" and len(argv) >= 2 and argv[1] in ("start", "stop", "status"):
         return ["--daemon-action", argv[1], *argv[2:]]
-    if argv and argv[0] == "sessions":
+    if argv[0] == "sessions":
         return ["--list-sessions", *argv[1:]]
+    if argv[0] == "config" and len(argv) >= 2 and argv[1] in ("show", "path", "set", "unset"):
+        action = argv[1]
+        rest = argv[2:]
+        if action == "set" and len(rest) >= 2:
+            return [
+                "--config-action", "set",
+                "--config-key", rest[0],
+                "--config-value", rest[1],
+                *rest[2:],
+            ]
+        if action == "unset" and len(rest) >= 1:
+            return ["--config-action", "unset", "--config-key", rest[0], *rest[1:]]
+        return ["--config-action", action, *rest]
+    if argv[0] == "voice":
+        return ["--voice", *argv[1:]]
     return argv
 
 
@@ -545,6 +614,43 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.load()
     if args.model:
         cfg.llm.model = args.model
+    # If --api-key was provided AND the config didn't already set one, use it.
+    if args.api_key and not cfg.llm.api_key:
+        cfg.llm.api_key = args.api_key
+    if args.provider and cfg.llm.provider == "openai" and not os.environ.get("HYUSK_LLM_PROVIDER"):
+        cfg.llm.provider = args.provider
+    if args.base_url:
+        cfg.llm.base_url = args.base_url
+
+    # Apply per-invocation overrides for API key / provider / base URL.
+    if args.api_key:
+        os.environ["HYUSK_LLM_API_KEY"] = args.api_key
+    if args.provider:
+        os.environ["HYUSK_LLM_PROVIDER"] = args.provider
+    if args.base_url:
+        os.environ["HYUSK_LLM_BASE_URL"] = args.base_url
+
+    # Handle config subcommand early.
+    if args.config_action:
+        from ..config.commands import path as _cfg_path
+        from ..config.commands import set_value, show, unset_value
+        action = args.config_action
+        if action == "show":
+            return show()
+        if action == "path":
+            return _cfg_path()
+        if action == "set":
+            if not args.config_key or args.config_value is None:
+                print("config set requires --config-key and --config-value", file=sys.stderr)
+                return 2
+            return set_value(args.config_key, args.config_value)
+        if action == "unset":
+            if not args.config_key:
+                print("config unset requires --config-key", file=sys.stderr)
+                return 2
+            return unset_value(args.config_key)
+        print(f"unknown config action: {action}", file=sys.stderr)
+        return 2
 
     if args.voice:
         from ..voice.client import main as _voice_main
@@ -561,6 +667,10 @@ def main(argv: list[str] | None = None) -> int:
             voice_args.extend(["--port", str(args.port)])
         if args.no_tts:
             voice_args.append("--no-tts")
+        if args.tts_backend:
+            voice_args.extend(["--tts-backend", args.tts_backend])
+        if args.tts_voice:
+            voice_args.extend(["--tts-voice", args.tts_voice])
         return _voice_main(voice_args)
 
     if args.daemon_action:
