@@ -32,11 +32,11 @@ import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
 from ..agent.loop import Agent
-from ..agent.tasks import TaskManager, TaskState
+from ..agent.tasks import TaskManager, TaskState, TaskStore
 from ..config.config import Config
 from ..core.errors import HyuskError
 from ..events.events import Event, EventBus
-from ..llm.provider import LLMProvider
+from ..llm.provider import LLMProvider, Message
 from ..permissions.policy import PermissionPolicy
 from ..sessions.store import SessionStore
 from ..tools.registry import ToolRegistry
@@ -68,6 +68,7 @@ class DaemonContext:
     session_dir: str
     task_manager: TaskManager
     store: SessionStore
+    task_store: TaskStore | None = None
 
     def new_agent(self) -> Agent:
         return Agent(
@@ -237,6 +238,69 @@ async def _dispatch(
     if mtype == "run":
         await _submit(ws, ctx, state, msg, forwarders)
         return
+    if mtype == "version":
+        # V4: protocol version handshake.
+        await _send(
+            ws,
+            {
+                "type": "version",
+                "version": "0.4.0",
+                "protocol": 4,
+            },
+        )
+        return
+    if mtype == "task_detail":
+        # V4: return full TaskInfo for a task (including the transcript).
+        tid = msg.get("task_id")
+        if not tid or ctx.task_store is None:
+            await _send(
+                ws,
+                {
+                    "type": "error",
+                    "message": "task_detail requires task_id and a configured store",
+                },
+            )
+            return
+        info = ctx.task_store.load(str(tid))
+        if info is None:
+            await _send(ws, {"type": "error", "message": f"unknown task: {tid}"})
+            return
+        await _send(ws, {"type": "task_detail", "task": info.to_dict()})
+        return
+    if mtype == "list_tasks_all":
+        # V4: list persisted tasks too (not just in-memory).
+        all_infos: list[dict] = []
+        if ctx.task_store is not None:
+            all_infos.extend(t.to_dict() for t in ctx.task_store.list())
+        # also include any in-memory tasks
+        in_mem = {t.id: t.to_dict() for t in ctx.task_manager.list()}
+        for k, v in in_mem.items():
+            if not any(x["id"] == k for x in all_infos):
+                all_infos.append(v)
+        await _send(ws, {"type": "tasks", "tasks": all_infos})
+        return
+    if mtype == "compact_session":
+        # V4: ask the LLM to summarize the session. The daemon returns
+        # the new compact session_id and replaces the on-disk session.
+        sid = msg.get("session_id")
+        if not sid:
+            await _send(ws, {"type": "error", "message": "compact_session requires session_id"})
+            return
+        try:
+            new_sid = await _compact_session(ctx, str(sid))
+            await _send(ws, {"type": "compacted", "session_id": sid, "new_session_id": new_sid})
+        except HyuskError as exc:
+            await _send(ws, {"type": "error", "message": str(exc)})
+        return
+    if mtype == "discard_task":
+        # V4: drop a persisted task record (does not affect the session).
+        tid = msg.get("task_id")
+        if not tid or ctx.task_store is None:
+            await _send(ws, {"type": "error", "message": "discard_task requires task_id"})
+            return
+        ctx.task_store.delete(str(tid))
+        await _send(ws, {"type": "discarded", "task_id": tid})
+        return
     await _send(ws, {"type": "error", "message": f"unknown message type: {mtype}"})
 
 
@@ -302,6 +366,71 @@ async def _submit(
     )
     fwd.start()
     forwarders[task.id] = fwd
+
+
+async def _compact_session(ctx: DaemonContext, session_id: str) -> str:
+    """Ask the LLM to summarize a long session and save the result as a
+    new session. Returns the new session id.
+    """
+    from ..sessions.session import Session
+
+    old = ctx.store.load(session_id)
+    if old is None:
+        raise HyuskError(f"unknown session: {session_id}")
+
+    # Build a prompt asking the model to summarize the conversation.
+    lines = []
+    for m in old.messages:
+        role = m.role
+        content = (m.content or "")[:500]
+        if m.tool_calls:
+            tool_names = ", ".join(tc.name for tc in m.tool_calls)
+            content = f"{content} [calls: {tool_names}]" if content else f"[calls: {tool_names}]"
+        lines.append(f"{role}: {content}")
+    transcript = "\n".join(lines)
+    if len(transcript) > 20000:
+        transcript = transcript[:20000] + "\n... [truncated]"
+
+    summary_messages = [
+        Message(
+            role="system",
+            content=(
+                "You are a session compaction assistant. Summarize the "
+                "following conversation in a way that preserves the user's "
+                "goals, any decisions that were made, file paths that were "
+                "mentioned, and any open follow-up questions. Output plain "
+                "prose, no bullet points."
+            ),
+        ),
+        Message(role="user", content=f"Summarize:\n{transcript}"),
+    ]
+    try:
+        resp = ctx.llm.chat(summary_messages)
+    except Exception:
+        # Fall back to a deterministic summary if the LLM is unreachable.
+        summary_text = f"[auto-summary of session {session_id}: {len(old.messages)} messages]"
+    else:
+        summary_text = resp.text or "(no summary)"
+    new_session = Session.create()
+    new_session.metadata["_store_dir"] = ctx.session_dir
+    new_session.metadata["compacted_from"] = session_id
+    new_session.add(
+        Message(
+            role="system",
+            content=(
+                "You are Hyusk. This session was compacted from a previous "
+                f"session (id={session_id}). Here is a summary:\n\n{summary_text}"
+            ),
+        )
+    )
+    new_session.add(
+        Message(
+            role="user",
+            content="(continue; this is a compacted session)",
+        )
+    )
+    new_session.save_self()
+    return new_session.id
 
 
 def _forwarder_thread(
@@ -386,6 +515,8 @@ def build_context() -> DaemonContext:
     policy = build_policy(cfg)
     llm = build_provider(cfg)
     store = SessionStore(base_dir=cfg.session_dir)
+    task_store_path = Path(cfg.session_dir).parent / "tasks"
+    task_store = TaskStore(base_dir=str(task_store_path))
     task_manager = TaskManager(
         cfg=cfg,
         llm=llm,
@@ -393,7 +524,11 @@ def build_context() -> DaemonContext:
         policy=policy,
         session_dir=cfg.session_dir,
         grant_callback=None,
+        store=task_store,
     )
+    # V4: restore any tasks that were running when the daemon last shut down.
+    # They are marked INTERRUPTED; the user can list them and decide.
+    task_manager.restore()
     return DaemonContext(
         cfg=cfg,
         registry=registry,
@@ -403,6 +538,7 @@ def build_context() -> DaemonContext:
         session_dir=cfg.session_dir,
         task_manager=task_manager,
         store=store,
+        task_store=task_store,
     )
 
 

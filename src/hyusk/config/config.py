@@ -20,13 +20,29 @@ from typing import Any
 
 
 def user_config_dir() -> Path:
-    """Return the user-level config directory, creating it if missing."""
+    """Return the user-level config directory, creating it if missing.
+
+    Order of precedence:
+      1. `HYUSK_CONFIG_DIR` env var (if set) — used by tests and overrides everything.
+      2. `XDG_CONFIG_HOME` (Linux/macOS) — useful for testing on any platform.
+      3. Platform default: %APPDATA% on Windows, ~/Library/Application Support on
+         macOS, ~/.config on Linux.
+    """
+    override = os.environ.get("HYUSK_CONFIG_DIR")
+    if override:
+        path = Path(override)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    elif sys.platform == "darwin":
-        base = str(Path.home() / "Library" / "Application Support")
     else:
-        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        # On macOS and Linux, respect XDG_CONFIG_HOME if set (useful for
+        # testing and for users who prefer XDG-style layout on macOS).
+        base = os.environ.get("XDG_CONFIG_HOME") or (
+            str(Path.home() / "Library" / "Application Support")
+            if sys.platform == "darwin"
+            else str(Path.home() / ".config")
+        )
     path = Path(base) / "hyusk"
     path.mkdir(parents=True, exist_ok=True)
     return path
