@@ -1,26 +1,43 @@
-"""V2 CLI entry point.
+"""V3 CLI entry point.
 
 Subcommands:
-  hyusk [PROMPT]            # REPL (default) or one-shot if PROMPT supplied
-  hyusk daemon start        # start the daemon (foreground)
-  hyusk daemon stop         # stop the daemon
-  hyusk daemon status       # print daemon status
-  hyusk sessions            # list sessions (alias for --list-sessions)
+  hyusk [PROMPT]            # one-shot (foreground)
+  hyusk                     # REPL (foreground by default; supports bg: prompts)
+  hyusk --daemon-action start|stop|status
+  hyusk --list-sessions
   hyusk --help
 
-If a daemon is running on the configured host:port, the CLI sends its work
-to the daemon over WebSocket. Otherwise it falls back to an in-process
-agent (V1 behavior).
+REPL special commands:
+  bg: <prompt>          # start a background task; return its id
+  steer <id> <message>  # inject a follow-up message into a running task
+  cancel <id>           # cancel a running task
+  tasks                 # list active/recent tasks
+  tools                 # list available tools
+  session               # show the current foreground session id
+  reset                 # next prompt starts a new session
+  help                  # show this list
+  exit | quit | :q      # leave the REPL
+
+If a daemon is running on the configured host:port, the CLI uses it.
+Otherwise it falls back to a local in-process agent (one task at a time,
+no real concurrency, but the same UX).
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
+import time
 
 from ..agent.loop import Agent
+from ..agent.tasks import Task, TaskManager
 from ..client.client import (
+    DaemonClient,
+    EventMessage,
+    PendingAsk,
+    TaskDone,
     daemon_reachable,
     list_sessions_sync,
     run_over_daemon_sync,
@@ -34,8 +51,9 @@ from ..daemon.server import (
 )
 from ..events.events import EventBus
 from ..sessions.session import Session
+from ..sessions.store import SessionStore
 
-# ---- helpers ----
+# ---------- helpers ----------
 
 
 def _in_process_agent(cfg: Config, *, no_confirm: bool) -> Agent:
@@ -68,7 +86,8 @@ def _interactive_grant(tool_name: str, arguments: dict) -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
-def _render_event(event_name: str, data: dict) -> None:
+def _render_event(event_name: str, data: dict, *, task_id: str | None = None) -> None:
+    prefix = f"[{task_id[:8]}] " if task_id else ""
     if event_name == "agent.text":
         text = data.get("text", "")
         if text:
@@ -77,7 +96,7 @@ def _render_event(event_name: str, data: dict) -> None:
     elif event_name == "tool.started":
         name = data.get("name", "?")
         args = data.get("arguments", {})
-        sys.stderr.write(f"\n-> {name}\n")
+        sys.stderr.write(f"\n{prefix}-> {name}\n")
         for k, v in args.items():
             sys.stderr.write(f"   {k}: {_short(v)}\n")
         sys.stderr.flush()
@@ -91,7 +110,9 @@ def _render_event(event_name: str, data: dict) -> None:
         sys.stderr.flush()
     elif event_name == "agent.completed":
         iters = data.get("iterations", 0)
-        sys.stderr.write(f"\n\u2014 done ({iters} iteration{'s' if iters != 1 else ''})\n")
+        cancelled = data.get("cancelled", False)
+        marker = " (cancelled)" if cancelled else ""
+        sys.stderr.write(f"\n{prefix}\u2014 done ({iters} iteration{'s' if iters != 1 else ''}){marker}\n")
         sys.stderr.flush()
 
 
@@ -102,7 +123,7 @@ def _short(value, limit: int = 80) -> str:
     return s
 
 
-# ---- one-shot path ----
+# ---------- one-shot path ----------
 
 
 def _run_one_shot(
@@ -113,40 +134,65 @@ def _run_one_shot(
     no_confirm: bool,
     use_daemon: bool,
 ) -> int:
-    if use_daemon:
-        if not daemon_reachable(cfg.daemon.host, cfg.daemon.port):
-            print(
-                f"[hyusk] daemon not reachable on {cfg.daemon.host}:{cfg.daemon.port}; "
-                "falling back to in-process agent",
-                file=sys.stderr,
-            )
-            use_daemon = False
+    if use_daemon and not daemon_reachable(cfg.daemon.host, cfg.daemon.port):
+        print(
+            f"[hyusk] daemon not reachable on {cfg.daemon.host}:{cfg.daemon.port}; "
+            "falling back to in-process agent",
+            file=sys.stderr,
+        )
+        use_daemon = False
+
     if use_daemon:
         return _run_one_shot_via_daemon(cfg, prompt=prompt, session_id=session_id)
 
-    agent = _in_process_agent(cfg, no_confirm=no_confirm)
-
+    store = SessionStore(base_dir=cfg.session_dir)
     if session_id:
         try:
-            session = Session.load(cfg.session_dir, session_id)
+            session = store.load(session_id)
         except Exception as exc:
             print(f"[hyusk] failed to load session: {exc}", file=sys.stderr)
             return 2
     else:
-        session = Session.create()
-
-    bus = agent.bus
-    bus.subscribe(lambda ev: _render_event(ev.type.value, ev.data))
-
-    try:
-        result = agent.run(list(session.messages), user_input=prompt)
-        session.messages = list(result.session_messages)
-        session.save(cfg.session_dir)
-        print(f"\n[session {session.id}]")
-        return 0
-    except Exception as exc:  # noqa: BLE001
-        print(f"[hyusk] {type(exc).__name__}: {exc}", file=sys.stderr)
+        session = store.new()
+    tm = _build_local_task_manager(cfg, no_confirm=no_confirm)
+    task = tm.submit(input_text=prompt, session=session)
+    info = task.result(timeout=600.0)
+    for ev in _collect_events_synchronously(task):
+        _render_event(ev.event, ev.data)
+    if info is None:
+        print("[hyusk] task timed out", file=sys.stderr)
         return 1
+    if info.error:
+        print(f"[hyusk] {info.error}", file=sys.stderr)
+        return 1
+    print(f"\n[session {session.id}  task {info.id[:8]}]")
+    return 0
+
+
+def _collect_events_synchronously(task: Task) -> list[EventMessage]:
+    """Drain a finished task's events from its bus."""
+    out: list[EventMessage] = []
+    q, _ = task.events()
+    while True:
+        try:
+            ev = q.get_nowait()
+        except Exception:
+            break
+        if ev is None:
+            break
+        out.append(EventMessage(task_id=task.id, event=ev.type.value, data=ev.data))
+    return out
+
+
+def _build_local_task_manager(cfg: Config, *, no_confirm: bool) -> TaskManager:
+    return TaskManager(
+        cfg=cfg,
+        llm=build_provider(cfg),
+        registry=build_registry(),
+        policy=build_policy(cfg),
+        session_dir=cfg.session_dir,
+        grant_callback=None if no_confirm else _interactive_grant,
+    )
 
 
 def _run_one_shot_via_daemon(cfg: Config, *, prompt: str, session_id: str | None) -> int:
@@ -161,19 +207,16 @@ def _run_one_shot_via_daemon(cfg: Config, *, prompt: str, session_id: str | None
     except Exception as exc:  # noqa: BLE001
         print(f"[hyusk] daemon error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-
-    # Replay collected events through the same renderer for consistent UI.
     for ev in outcome.events:
-        _render_event(ev.event, ev.data)
-
+        _render_event(ev.event, ev.data, task_id=ev.task_id)
     if not outcome.ok:
-        print(f"[hyusk] {outcome.error}", file=sys.stderr)
+        print(f"[hyusk] {outcome.error or 'cancelled'}", file=sys.stderr)
         return 1
-    print(f"\n[session {outcome.session_id}]")
+    print(f"\n[session {outcome.session_id}  task {outcome.task_id[:8] if outcome.task_id else '?'}]")
     return 0
 
 
-# ---- REPL path ----
+# ---------- REPL ----------
 
 
 def _run_repl(
@@ -184,38 +227,32 @@ def _run_repl(
     use_daemon: bool,
 ) -> int:
     if use_daemon and daemon_reachable(cfg.daemon.host, cfg.daemon.port):
-        return _run_repl_via_daemon(cfg, session_id=session_id)
+        return _run_repl_via_daemon(cfg, session_id=session_id, no_confirm=no_confirm)
     if use_daemon:
         print(
             f"[hyusk] daemon not reachable on {cfg.daemon.host}:{cfg.daemon.port}; "
             "starting in-process agent",
             file=sys.stderr,
         )
+    return _run_repl_inprocess(cfg, session_id=session_id, no_confirm=no_confirm)
 
-    # In-process REPL
-    from .repl import run_repl
 
-    agent = _in_process_agent(cfg, no_confirm=no_confirm)
+def _run_repl_inprocess(cfg: Config, *, session_id: str | None, no_confirm: bool) -> int:
+    print("hyusk v0.3.0  (in-process agent; one task at a time)")
+    print("(type 'help' for commands)")
+    store = SessionStore(base_dir=cfg.session_dir)
     if session_id:
         try:
-            session = Session.load(cfg.session_dir, session_id)
+            session = store.load(session_id)
         except Exception as exc:
             print(f"[hyusk] failed to load session: {exc}", file=sys.stderr)
             return 2
     else:
-        session = Session.create()
-    return run_repl(
-        agent=agent,
-        session=session,
-        session_dir=cfg.session_dir,
-        grant_callback=None if no_confirm else _interactive_grant,
-    )
+        session = store.new()
+    tm = _build_local_task_manager(cfg, no_confirm=no_confirm)
+    current_session_id = session.id
+    tasks: dict[str, Task] = {}
 
-
-def _run_repl_via_daemon(cfg: Config, *, session_id: str | None) -> int:
-    current_session = session_id
-    print(f"hyusk v0.2.0  (connected to daemon at {cfg.daemon.host}:{cfg.daemon.port})")
-    print("(type 'exit' or Ctrl-D to quit, 'help' for commands)")
     while True:
         try:
             user_input = input("hyusk > ")
@@ -226,53 +263,176 @@ def _run_repl_via_daemon(cfg: Config, *, session_id: str | None) -> int:
         if not cmd:
             continue
         if cmd in ("exit", "quit", ":q"):
+            for t in tasks.values():
+                t.cancel()
             break
         if cmd == "help":
-            print("commands: help, exit, session, reset, tools, status, daemon")
+            _print_help()
             continue
         if cmd == "session":
-            print(f"current session: {current_session or '<new>'}")
+            print(f"current session: {current_session_id}")
             continue
         if cmd == "reset":
-            current_session = None
-            print("next turn will start a new session")
+            current_session_id = store.new().id
+            print("next prompt will start a new session")
             continue
         if cmd == "tools":
-            print("available tools (resolved from server):")
-            print("  - list_directory, read_file, write_file")
-            print("  - shell.execute, list_processes, kill_process")
-            print("  - git.status, git.diff, git.log, git.branch")
+            for tool in build_registry().all():
+                print(f"  - {tool.name} ({tool.permission})")
             continue
-        if cmd == "status":
-            print(f"daemon: {cfg.daemon.host}:{cfg.daemon.port} (connected)")
+        if cmd == "tasks":
+            for ti in tm.list():
+                print(f"  {ti.id[:8]}  {ti.state.value:9s}  iter={ti.iterations:2d}  {ti.input[:60]!r}")
             continue
-        if cmd == "daemon":
-            print(f"daemon host:port = {cfg.daemon.host}:{cfg.daemon.port}")
+        if cmd.startswith("cancel "):
+            tid = cmd[7:].strip()
+            ok = tm.cancel(tid)
+            print(f"cancel: {tid} ok={ok}")
+            continue
+        if cmd.startswith("steer "):
+            parts = cmd.split(None, 2)
+            if len(parts) < 3:
+                print("usage: steer <id> <message>")
+                continue
+            _, tid, msg = parts
+            ok = tm.steer(tid, msg)
+            print(f"steer: {tid} ok={ok}")
             continue
 
+        # Submit a new task in the foreground (in-process: blocks until done).
         try:
-            outcome = run_over_daemon_sync(
-                host=cfg.daemon.host,
-                port=cfg.daemon.port,
-                input_text=user_input,
-                session_id=current_session,
-                model=cfg.llm.model,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[hyusk] daemon error: {type(exc).__name__}: {exc}", file=sys.stderr)
-            continue
-
-        if not outcome.ok:
-            print(f"[hyusk] {outcome.error}", file=sys.stderr)
-            continue
-        for ev in outcome.events:
-            _render_event(ev.event, ev.data)
-        current_session = outcome.session_id
-        print()
+            sess = store.load(current_session_id)
+        except Exception:
+            sess = store.new()
+            current_session_id = sess.id
+        task = tm.submit(input_text=cmd, session=sess)
+        tasks[task.id] = task
+        info = task.result(timeout=600.0)
+        for ev in _collect_events_synchronously(task):
+            _render_event(ev.event, ev.data, task_id=task.id)
+        if info and info.error:
+            print(f"[hyusk] {info.error}", file=sys.stderr)
     return 0
 
 
-# ---- daemon subcommand ----
+def _run_repl_via_daemon(cfg: Config, *, session_id: str | None, no_confirm: bool) -> int:
+    print(f"hyusk v0.3.0  (connected to daemon at {cfg.daemon.host}:{cfg.daemon.port})")
+    print("(type 'help' for commands)")
+
+    async def main() -> int:
+        client = DaemonClient(cfg.daemon.host, cfg.daemon.port)
+        await client.connect()
+        # Render every event we get. We tag it with the task id.
+        client.on_event(lambda ev: _render_event(ev.event, ev.data, task_id=ev.task_id))
+        client.on_done(lambda d: _print_done_summary(d))
+        client.on_ask(lambda ask: _ask_prompt(ask))
+        client.on_error(lambda err: print(f"[hyusk] {err}", file=sys.stderr))
+        try:
+            current_session_id = session_id
+            while True:
+                try:
+                    user_input = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: input("hyusk > ")
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                cmd = user_input.strip()
+                if not cmd:
+                    continue
+                if cmd in ("exit", "quit", ":q"):
+                    break
+                if cmd == "help":
+                    _print_help()
+                    continue
+                if cmd == "session":
+                    print(f"current session: {current_session_id or '<new>'}")
+                    continue
+                if cmd == "reset":
+                    current_session_id = None
+                    print("next prompt will start a new session")
+                    continue
+                if cmd == "tools":
+                    for tool in build_registry().all():
+                        print(f"  - {tool.name} ({tool.permission})")
+                    continue
+                if cmd == "tasks":
+                    ts = await client.list_tasks()
+                    if not ts:
+                        print("(no active tasks)")
+                    for ti in ts:
+                        print(
+                            f"  {ti['id'][:8]}  {ti['state']:9s}  iter={ti.get('iterations', 0):2d}  "
+                            f"{ti.get('input', '')[:60]!r}"
+                        )
+                    continue
+                if cmd.startswith("cancel "):
+                    tid = cmd[7:].strip()
+                    await client.cancel(tid)
+                    continue
+                if cmd.startswith("steer "):
+                    parts = cmd.split(None, 2)
+                    if len(parts) < 3:
+                        print("usage: steer <id> <message>")
+                        continue
+                    _, tid, msg = parts
+                    await client.steer(tid, msg)
+                    continue
+                if cmd.startswith("bg: "):
+                    # Background task.
+                    bg_text = cmd[4:].strip()
+                    task = await client.submit(input_text=bg_text, session_id=current_session_id)
+                    current_session_id = task.session_id
+                    print(f"  started task {task.id[:8]} (session {task.session_id[:8]})")
+                    continue
+
+                # Foreground: submit and wait.
+                task = await client.submit(input_text=cmd, session_id=current_session_id)
+                current_session_id = task.session_id
+                done = await client.wait_done(task.id, timeout=600.0)
+                _print_done_summary(done)
+        finally:
+            await client.close()
+        return 0
+
+    return asyncio.run(main())
+
+
+def _print_done_summary(d: TaskDone) -> None:
+    marker = " (cancelled)" if d.cancelled else ""
+    err = f" error={d.error}" if d.error else ""
+    print(f"\n[{d.task_id[:8]}] state={d.state} iters={d.iterations}{marker}{err}")
+
+
+def _ask_prompt(ask: PendingAsk) -> bool:
+    if not sys.stdin.isatty():
+        sys.stderr.write(f"[hyusk] refusing '{ask.tool}' (no TTY for confirmation)\n")
+        return False
+    sys.stderr.write(f"[{ask.task_id[:8]}] Allow {ask.tool}? args={ask.arguments} [y/N] ")
+    sys.stderr.flush()
+    try:
+        ans = input()
+    except EOFError:
+        return False
+    return ans.strip().lower() in ("y", "yes")
+
+
+def _print_help() -> None:
+    print(
+        "commands:\n"
+        "  bg: <prompt>            start a background task\n"
+        "  steer <id> <message>    inject a follow-up message into a running task\n"
+        "  cancel <id>             cancel a running task\n"
+        "  tasks                   list tasks (active + recent)\n"
+        "  session                 show the current session id\n"
+        "  reset                   next prompt starts a new session\n"
+        "  tools                   list available tools\n"
+        "  help                    show this list\n"
+        "  exit | quit | :q        leave the REPL\n"
+    )
+
+
+# ---------- daemon subcommand ----------
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -293,17 +453,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return 0
         pid = info["pid"]
         try:
-            os.kill(pid, 15)  # SIGTERM
+            os.kill(pid, 15)
         except OSError as exc:
             print(f"failed to signal daemon: {exc}", file=sys.stderr)
             return 1
-        # wait up to ~3s for the daemon to release the pidfile
         for _ in range(30):
             if not is_running():
                 clear_pid_file()
                 print(f"daemon (pid={pid}) stopped")
                 return 0
-            import time
             time.sleep(0.1)
         print("daemon did not stop within 3s; try again or kill -9", file=sys.stderr)
         return 1
@@ -318,13 +476,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     return 2
 
 
-# ---- argparse ----
+# ---------- argparse ----------
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hyusk",
-        description="Cross-platform computer agent (V2: with optional daemon).",
+        description="Cross-platform computer agent (V3: concurrent tasks, daemon, streaming).",
     )
     parser.add_argument(
         "prompt",
@@ -359,8 +517,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _normalize_argv(argv: list[str] | None) -> list[str]:
-    """Translate the legacy `hyusk daemon start` syntax into `--daemon-action start`
-    and `hyusk sessions` into `--list-sessions` so we can use simple flags."""
     if argv is None:
         return []
     if argv and argv[0] == "daemon" and len(argv) >= 2 and argv[1] in ("start", "stop", "status"):
@@ -391,22 +547,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             except Exception as exc:  # noqa: BLE001
                 print(f"[hyusk] daemon error: {exc}", file=sys.stderr)
-                # fall through to local listing
         for s in Session.list_sessions(cfg.session_dir):
             print(f"{s['id']}  created={s.get('created_at')}")
         return 0
 
     use_daemon = not args.no_daemon
-    if args.daemon_only:
-        if not daemon_reachable(cfg.daemon.host, cfg.daemon.port):
-            print(
-                f"[hyusk] daemon not reachable on {cfg.daemon.host}:{cfg.daemon.port}",
-                file=sys.stderr,
-            )
-            return 1
+    if args.daemon_only and not daemon_reachable(cfg.daemon.host, cfg.daemon.port):
+        print(
+            f"[hyusk] daemon not reachable on {cfg.daemon.host}:{cfg.daemon.port}",
+            file=sys.stderr,
+        )
+        return 1
 
-    # `--list-sessions` is handled above; default to one-shot if a
-    # prompt was supplied, otherwise start the REPL.
     if args.prompt:
         return _run_one_shot(
             cfg,
@@ -415,7 +567,6 @@ def main(argv: list[str] | None = None) -> int:
             no_confirm=args.no_confirm,
             use_daemon=use_daemon,
         )
-
     return _run_repl(
         cfg,
         session_id=args.session,
