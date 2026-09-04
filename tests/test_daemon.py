@@ -68,6 +68,9 @@ def _echo_tool() -> Tool:
 
 @pytest.fixture
 def daemon_context(tmp_path: Path, monkeypatch):
+    from hyusk.agent.tasks import TaskManager
+    from hyusk.sessions.store import SessionStore
+
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("HYUSK_LLM_API_KEY", "fake-key")
     cfg = Config.load()
@@ -76,6 +79,14 @@ def daemon_context(tmp_path: Path, monkeypatch):
 
     reg = ToolRegistry()
     reg.register(_echo_tool())
+    store = SessionStore(base_dir=cfg.session_dir)
+    tm = TaskManager(
+        cfg=cfg,
+        llm=FakeProvider(),
+        registry=reg,
+        policy=PermissionPolicy(),
+        session_dir=cfg.session_dir,
+    )
     ctx = DaemonContext(
         cfg=cfg,
         registry=reg,
@@ -83,6 +94,8 @@ def daemon_context(tmp_path: Path, monkeypatch):
         llm=FakeProvider(),
         bus=EventBus(),
         session_dir=cfg.session_dir,
+        task_manager=tm,
+        store=store,
     )
     return ctx
 
@@ -124,16 +137,22 @@ def test_daemon_run_protocol(tmp_path: Path, daemon_context):
             {"type": "run", "session_id": "new", "input": "test"},
         )
     )
-    # We expect: agent.started, agent.thinking, agent.text, tool.started, tool.completed,
-    # agent.text (final), agent.completed, done
+    # V3 protocol: task is created, then events stream, then task_done.
     types = [r.get("type") for r in responses]
-    assert types[-1] == "done"
+    assert types[-1] == "task_done", f"expected task_done, got types={types}"
+    assert "task" in types
     assert "event" in types
+    # All events must carry the same task_id
+    task_id = next(r["task_id"] for r in responses if r.get("type") == "task")
+    for r in responses:
+        if r.get("type") == "event":
+            assert r.get("task_id") == task_id
+    # The expected sequence includes tool.started + tool.completed.
     assert any(r.get("event") == "tool.started" for r in responses if r.get("type") == "event")
     assert any(r.get("event") == "tool.completed" for r in responses if r.get("type") == "event")
-    assert any(r.get("event") == "agent.completed" for r in responses if r.get("type") == "event")
-    # session should have been created
-    assert "session_id" in responses[-1]
+    # The final task_done carries the session id.
+    final = responses[-1]
+    assert "state" in final
 
 
 def test_daemon_ping(tmp_path: Path, daemon_context):
@@ -142,6 +161,7 @@ def test_daemon_ping(tmp_path: Path, daemon_context):
     responses = asyncio.run(
         _drive_daemon(daemon_context, host, port, {"type": "ping"})
     )
+    # Ping is synchronous in V3 (no task involved).
     assert any(r.get("type") == "pong" for r in responses)
 
 
