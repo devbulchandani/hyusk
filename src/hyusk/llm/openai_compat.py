@@ -1,11 +1,8 @@
-"""OpenAI-compatible HTTP provider.
+"""OpenAI-compatible HTTP provider (streaming + non-streaming).
 
-This implementation targets the OpenAI Chat Completions API, which is also
-emulated by OpenRouter, Together, Groq, LM Studio, llama.cpp, and most
-local OpenAI-compatible servers. No SDK dependency.
+Works with OpenAI, OpenRouter, Together, Groq, LM Studio, llama.cpp, etc.
 
-For an Anthropic provider later, swap this file with one that calls the
-Anthropic Messages API; the agent loop stays unchanged.
+V2 adds SSE streaming via `chat_stream()`.
 """
 
 from __future__ import annotations
@@ -14,10 +11,18 @@ import json
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from typing import Any
 
 from ..core.errors import ProviderError
-from .provider import LLMProvider, LLMResponse, Message, ToolCallRequest, ToolSpec
+from .provider import (
+    LLMChunk,
+    LLMProvider,
+    LLMResponse,
+    Message,
+    ToolCallRequest,
+    ToolSpec,
+)
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -27,6 +32,8 @@ class OpenAICompatProvider(LLMProvider):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         self.default_model = default_model
+
+    # ----- non-streaming -----
 
     def chat(
         self,
@@ -41,14 +48,104 @@ class OpenAICompatProvider(LLMProvider):
         body: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": [_message_to_dict(m) for m in messages],
+            "stream": False,
         }
         if temperature is not None:
             body["temperature"] = float(temperature)
         if tools:
             body["tools"] = [_tool_to_dict(t) for t in tools]
             body["tool_choice"] = "auto"
+        raw = self._post_json("/chat/completions", body)
+        return _parse_response(raw)
+
+    # ----- streaming -----
+
+    def chat_stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec] | None = None,
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+    ) -> Iterator[LLMChunk]:
+        if not self.api_key:
+            raise ProviderError("missing API key: set OPENAI_API_KEY or HYUSK_LLM_API_KEY")
+        body: dict[str, Any] = {
+            "model": model or self.default_model,
+            "messages": [_message_to_dict(m) for m in messages],
+            "stream": True,
+        }
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        if tools:
+            body["tools"] = [_tool_to_dict(t) for t in tools]
+            body["tool_choice"] = "auto"
+
+        accumulated_text = ""
+        # Map of tool_call_index -> {id, name, arguments(str)}
+        tool_state: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+
+        for sse in self._post_stream("/chat/completions", body):
+            chunk = sse.get("choices", [{}])[0]
+            delta = chunk.get("delta") or {}
+            if "content" in delta and delta["content"]:
+                accumulated_text += delta["content"]
+                yield LLMChunk(text_delta=delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                state = tool_state.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    state["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    state["name"] += fn["name"]
+                if "arguments" in fn:
+                    state["arguments"] += fn["arguments"]
+                # Yield partial so consumers can show progress; the agent
+                # loop ignores partials and only acts on the final response.
+                ends_balanced = state["arguments"].rstrip().endswith(("}", "]"))
+                if ends_balanced:
+                    try:
+                        args_obj = json.loads(state["arguments"])
+                    except json.JSONDecodeError:
+                        args_obj = None
+                else:
+                    args_obj = None
+                if args_obj is not None:
+                    yield LLMChunk(
+                        tool_call_delta=ToolCallRequest(
+                            name=state["name"] or "",
+                            arguments=args_obj,
+                            id=state["id"] or None,
+                        )
+                    )
+            if chunk.get("finish_reason"):
+                finish_reason = chunk["finish_reason"]
+
+        # Build final response
+        tool_calls: list[ToolCallRequest] = []
+        for idx in sorted(tool_state):
+            st = tool_state[idx]
+            try:
+                args = json.loads(st["arguments"]) if st["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {"_raw": st["arguments"]}
+            tool_calls.append(
+                ToolCallRequest(name=st.get("name") or "", arguments=args, id=st.get("id") or None)
+            )
+        response = LLMResponse(
+            text=accumulated_text,
+            tool_calls=tool_calls,
+            raw={"finish_reason": finish_reason},
+        )
+        yield LLMChunk(done=True, response=response)
+
+    # ----- HTTP helpers -----
+
+    def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            f"{self.base_url}{path}",
             data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -58,7 +155,7 @@ class OpenAICompatProvider(LLMProvider):
         )
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
+                return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
             raise ProviderError(f"LLM HTTP {exc.code}: {detail}") from exc
@@ -66,7 +163,44 @@ class OpenAICompatProvider(LLMProvider):
             raise ProviderError(f"LLM network error: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
             raise ProviderError(f"LLM returned invalid JSON: {exc}") from exc
-        return _parse_response(raw)
+
+    def _post_stream(self, path: str, body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Yield SSE chunks from a streaming endpoint."""
+        req = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=120)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise ProviderError(f"LLM HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise ProviderError(f"LLM network error: {exc.reason}") from exc
+
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    return
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _message_to_dict(m: Message) -> dict[str, Any]:

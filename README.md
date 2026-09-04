@@ -3,76 +3,77 @@
 > A small, clean, extensible foundation for a cross-platform **computer agent**.
 
 Hyusk is a local CLI agent that can run shell commands, read and write files,
-inspect processes, and inspect git repositories — through natural language. It
-is the V1 foundation for a future system that lets you control your Mac,
-Windows, or Linux computer by voice, mobile app, or another agent.
-
-The architecture is deliberately modular so future voice clients, phone apps,
-remote clients, and coding-agent integrations can plug into the same core
-without rewriting it.
+inspect processes, and inspect git repositories — through natural language. V2
+adds a long-running daemon and a WebSocket transport so future mobile, voice,
+and remote clients can plug into the same core without touching it.
 
 ---
 
-## What it does today (V1)
+## What is new in V2
+
+- **`hyusk daemon start|stop|status`** — long-running local daemon hosting
+  the agent, sessions, and event stream.
+- **WebSocket transport** — the daemon speaks a small JSON protocol. The CLI
+  is a thin client that connects to the daemon when one is running, and
+  falls back to an in-process agent when not.
+- **Streaming LLM responses** — both the OpenAI-compatible and Anthropic
+  providers emit incremental text deltas; the CLI renders them as they
+  arrive.
+- **Anthropic provider** — `HYUSK_LLM_PROVIDER=anthropic` to use the
+  Anthropic Messages API.
+- **53 tests passing**, including end-to-end WebSocket daemon tests with a
+  fake LLM provider.
+
+## What it does today (V2)
 
 - Interactive REPL and one-shot commands.
-- LLM-driven tool calling (OpenAI-compatible provider by default).
+- LLM-driven tool calling (OpenAI-compatible or Anthropic).
+- Streaming responses (real SSE for both providers).
 - Filesystem tools (`list_directory`, `read_file`, `write_file`) with safe
-  defaults: large files are truncated, missing files return structured
-  errors.
-- Shell tool with timeout, structured stdout/stderr/exit-code/duration
-  results.
-- Process tools (`list_processes`, `kill_process`) with a portable
-  interface (Posix now; Windows returns structured unsupported errors).
+  defaults.
+- Shell tool with timeout, structured stdout/stderr/exit/duration results.
+- Process tools (`list_processes`, `kill_process`).
 - Git tools (`git.status`, `git.diff`, `git.log`, `git.branch`).
-- Pluggable permission policy. Destructive tools require interactive
-  confirmation by default.
-- Sessions are persisted as JSON so a one-shot or REPL can be resumed.
-- Lightweight typed event bus so future WebSocket / mobile clients can
-  subscribe to the same stream the CLI renders.
-- Structured logging with secret-scrubbing filters.
-- 39 tests covering registry, shell, filesystem, permissions, agent loop,
-  events, sessions, config, git, process, and logging.
+- Pluggable permission policy; destructive tools always require
+  interactive confirmation by default.
+- Sessions are persisted as JSON and can be resumed.
+- Lightweight typed event bus — the same bus is exposed over WebSocket.
+- Structured logging with secret-scrubbing.
+- Daemon with `start|stop|status` lifecycle and pid file.
 
-## What it deliberately is **not** (yet)
+## What is **not** built yet (V2 still does not ship these)
 
-V1 is a foundation. These are intentionally **not** built yet:
+V2 still does **not** ship these — the interfaces are designed so they
+land without rewriting the core:
 
 - Wake-word / voice transcription / text-to-speech.
 - Mobile app, remote control, cloud backend.
 - Screen / computer-vision automation.
 - Browser automation, plugin marketplace.
-- A daemon / WebSocket server.
-
-The interfaces are designed so adding these later does not require rewriting
-the core. See [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
-- An OpenAI-compatible API key (or a custom base URL pointing at any
-  OpenAI-compatible server: OpenRouter, Together, Groq, LM Studio,
-  llama.cpp, etc.)
+- `uv` (recommended) or `pip`
+- An OpenAI-compatible **or** Anthropic API key.
 
-`git` must be installed for the git tools (the shell and filesystem tools
-work without it). On Linux/macOS, `ps` is used for process listing.
+`git` must be installed for the git tools. On Linux/macOS, `ps` is used for
+process listing.
 
 ---
 
 ## Installation
 
 ```bash
-# from source
 git clone https://github.com/devbulchandani/hyusk
 cd hyusk
 uv sync --extra dev
 uv run hyusk --help
 ```
 
-Or as a pip-installable package (once published):
+Or, as a pip-installable package:
 
 ```bash
 pip install hyusk
@@ -82,112 +83,131 @@ pip install hyusk
 
 ## Configuration
 
-Configuration is read from (in order of precedence):
+Loaded from (in order): environment variables prefixed with `HYUSK_`, a
+TOML config file in the platform user-config dir, then built-in defaults.
 
-1. Environment variables prefixed with `HYUSK_`
-2. A TOML file in the platform-specific user config directory
-3. Built-in defaults
+| Variable                | Purpose                                       |
+|-------------------------|-----------------------------------------------|
+| `HYUSK_LLM_PROVIDER`    | `openai` (default) or `anthropic`             |
+| `HYUSK_LLM_MODEL`       | model name (e.g. `gpt-4o-mini`, `claude-3-5-sonnet-latest`) |
+| `HYUSK_LLM_API_KEY`     | API key                                       |
+| `HYUSK_LLM_BASE_URL`    | OpenAI-compatible base URL                    |
+| `HYUSK_LLM_STREAM`      | `1`/`true` (default) to stream responses     |
+| `OPENAI_API_KEY`        | fallback for the API key                      |
+| `ANTHROPIC_API_KEY`     | fallback for the API key                      |
+| `HYUSK_DAEMON_HOST`     | daemon bind host (default `127.0.0.1`)        |
+| `HYUSK_DAEMON_PORT`     | daemon port (default `8765`)                  |
+| `HYUSK_LOG_LEVEL`       | `DEBUG`/`INFO`/`WARNING`/`ERROR`              |
 
-The user config directory is:
-
-| Platform | Path                                                          |
-|----------|---------------------------------------------------------------|
-| macOS    | `~/Library/Application Support/hyusk/config.toml`             |
-| Linux    | `${XDG_CONFIG_HOME:-~/.config}/hyusk/config.toml`             |
-| Windows  | `%APPDATA%\hyusk\config.toml`                              |
-
-Example `config.toml`:
+Example `config.toml` at the platform user-config dir:
 
 ```toml
 [llm]
-provider = "openai"             # or any openai-compatible target
-model = "gpt-4o-mini"
-api_key = "sk-..."              # prefer env var in practice
-base_url = ""                   # e.g. "https://openrouter.ai/api/v1"
+provider = "anthropic"     # or "openai"
+model = "claude-3-5-sonnet-latest"
+api_key = "sk-..."         # prefer env var
 
 [agent]
 max_iterations = 25
-max_tool_output_bytes = 200000
-max_file_read_bytes = 1000000
+
+[daemon]
+host = "127.0.0.1"
+port = 8765
 
 [permissions]
-# Per-tool overrides. Categories: READ, WRITE, EXECUTE, DESTRUCTIVE.
-policy = { "kill_process" = "DESTRUCTIVE" }
-# Tools that always require interactive confirmation.
 require_prompt = ["kill_process"]
 ```
 
-Environment variables (preferred for secrets):
-
-| Variable              | Purpose                                  |
-|-----------------------|------------------------------------------|
-| `HYUSK_LLM_PROVIDER`  | provider name (default `openai`)         |
-| `HYUSK_LLM_MODEL`     | model name                               |
-| `HYUSK_LLM_API_KEY`   | API key                                  |
-| `HYUSK_LLM_BASE_URL`  | OpenAI-compatible base URL               |
-| `OPENAI_API_KEY`      | fallback for the API key                  |
-| `ANTHROPIC_API_KEY`   | fallback for the API key                  |
-| `HYUSK_LOG_LEVEL`    | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-
-API keys are **never** logged: a `SecretFilter` strips common key names
-from log records.
+API keys are never logged (a `SecretFilter` strips common key names).
 
 ---
 
 ## Usage
 
-### Interactive REPL
+### Start the daemon (optional but recommended)
 
 ```bash
-$ hyusk
-hyusk v0.1.0  (type 'exit' or Ctrl-D to quit, 'help' for commands)
-hyusk > list the files in this directory
-hyusk is thinking...
-
-┌─ list_directory
-│ path: .
-└────────────────────────
-[ok in 12 ms]
-
-I'll inspect the directory for you. Here are the contents...
-
-hyusk > tools
-available tools:
-  - list_directory (READ)
-  - read_file (READ)
-  - write_file (WRITE)
-  - shell.execute (EXECUTE)
-  - list_processes (READ)
-  - kill_process (DESTRUCTIVE)
-  - git.status (READ)
-  - git.diff (READ)
-  - git.log (READ)
-  - git.branch (READ)
-
-hyusk > exit
+hyusk --daemon-action start      # foreground
+hyusk --daemon-action status     # is it running?
+hyusk --daemon-action stop       # stop it
 ```
+
+Once the daemon is running, every `hyusk` command — REPL, one-shot, or
+session list — uses the daemon transparently. If the daemon is not
+running, the CLI starts an in-process agent (V1 behavior).
 
 ### One-shot
 
 ```bash
 hyusk "show me the processes using the most CPU"
-hyusk "what's in README.md?"
+hyusk "what is in README.md?"
 hyusk "summarize recent git history"
+hyusk --no-daemon "..."        # force in-process agent
+hyusk --daemon-only "..."      # fail if daemon is unreachable
 ```
 
-### List / resume sessions
+### Interactive REPL
 
 ```bash
-hyusk --list-sessions
-hyusk --session <id> "continue from where we left off"
+$ hyusk
+hyusk v0.2.0  (connected to daemon at 127.0.0.1:8765)
+(type 'exit' or Ctrl-D to quit, 'help' for commands)
+hyusk > list the files in this directory
+
+-> list_directory
+   path: .
+   ok (12 ms)
+
+Here are the contents...
+
+hyusk > tools
+available tools (resolved from server):
+  - list_directory, read_file, write_file
+  - shell.execute, list_processes, kill_process
+  - git.status, git.diff, git.log, git.branch
+
+hyusk > exit
+```
+
+### Sessions
+
+```bash
+hyusk --list-sessions         # queries the daemon if running
+hyusk --session <id> "..."    # resume a session
 ```
 
 ### Useful flags
 
 ```bash
-hyusk --no-confirm "..."     # auto-allow destructive tools (use carefully)
-hyusk --model gpt-4o "..."    # override the configured model
+hyusk --model claude-3-5-sonnet-latest "..."
+hyusk --no-confirm "..."      # auto-allow destructive tools (careful)
 ```
+
+---
+
+## Daemon protocol
+
+V2 clients (and future mobile/voice clients) speak this JSON-over-WebSocket
+protocol with the daemon:
+
+```text
+client -> server:
+  {"type": "run", "session_id": "<id|new>", "input": "...", "model": "..."}
+  {"type": "list_sessions"}
+  {"type": "load_session", "id": "..."}
+  {"type": "ping"}
+
+server -> client:
+  {"type": "event", "event": "agent.started|tool.started|...", "data": {...}}
+  {"type": "done", "session_id": "...", "iterations": N, "text_chars": N}
+  {"type": "error", "message": "..."}
+  {"type": "sessions", "sessions": [...]}
+  {"type": "session", "session": {"id":..., "messages":[...]}}
+  {"type": "pong"}
+```
+
+There is no separate "streaming" message type — events already stream.
+Text comes through `agent.text` with `delta: true` for partial chunks.
 
 ---
 
@@ -195,10 +215,10 @@ hyusk --model gpt-4o "..."    # override the configured model
 
 | Tool              | Category    | Description                                          |
 |-------------------|-------------|------------------------------------------------------|
-| `list_directory`  | READ        | List directory entries with size and mtime.          |
-| `read_file`       | READ        | Read a UTF-8 text file; truncates very large files.  |
+| `list_directory`  | READ        | List directory entries.                              |
+| `read_file`       | READ        | Read a UTF-8 text file; truncates large files.       |
 | `write_file`      | WRITE       | Write a UTF-8 text file; creates parents.            |
-| `shell.execute`   | EXECUTE     | Run a shell command. Returns stdout/stderr/exit/duration. |
+| `shell.execute`   | EXECUTE     | Run a shell command.                                 |
 | `list_processes`  | READ        | List processes, sortable by cpu/mem/pid/time.        |
 | `kill_process`    | DESTRUCTIVE | Send TERM/KILL/INT/HUP to a PID.                     |
 | `git.status`      | READ        | Porcelain git status with branch line.               |
@@ -210,19 +230,19 @@ hyusk --model gpt-4o "..."    # override the configured model
 
 ## Security model
 
-- All tools declare a **permission category** (`READ`, `WRITE`, `EXECUTE`,
+- Tools declare a **permission category** (`READ`, `WRITE`, `EXECUTE`,
   `DESTRUCTIVE`).
-- A `PermissionPolicy` decides per call: `allow`, `deny`, or `ask`.
-- Destructive tools **always** require interactive confirmation by default.
-- In non-interactive contexts (no TTY), `kill_process` is **refused** rather
-  than silently auto-allowed.
-- `--no-confirm` bypasses interactive prompts (still subject to deny rules).
-- Shell output is capped; tool output is truncated at
-  `agent.max_tool_output_bytes` so the LLM cannot accidentally ingest a
-  multi-gigabyte log.
+- `PermissionPolicy` decides per call: `allow`, `deny`, or `ask`.
+- Destructive tools always require interactive confirmation by default.
+- In non-interactive contexts, `kill_process` is **refused** rather than
+  silently auto-allowed.
+- `--no-confirm` bypasses prompts (subject to deny rules).
+- Tool output is truncated at `agent.max_tool_output_bytes`.
+- API keys are scrubbed from logs.
 
-Future versions will support finer-grained policies (per-command allow
-lists, sandboxed execution, etc.) without changing tool code.
+In V2, the **daemon does not prompt**: the local CLI is responsible for
+prompting at the terminal. The daemon grants all `ask` calls (a future
+version can route them back to the connected client).
 
 ---
 
@@ -244,43 +264,45 @@ hyusk/
 ├── docs/
 │   └── architecture.md
 ├── src/hyusk/
-│   ├── cli/        # argparse, REPL, rendering
-│   ├── agent/      # agent loop
-│   ├── llm/        # provider abstraction + OpenAI-compat
+│   ├── cli/        # argparse + REPL rendering + daemon subcommands
+│   ├── agent/      # agent loop (streaming-aware)
+│   ├── llm/        # provider abstraction + OpenAI-compat + Anthropic
 │   ├── tools/      # tool base + registry + per-tool modules
 │   ├── permissions/# permission policy
 │   ├── sessions/   # session persistence
 │   ├── events/     # event bus
+│   ├── daemon/     # WebSocket server (V2)
+│   ├── client/     # WebSocket client used by the CLI (V2)
 │   ├── platform/   # OS abstractions (shell, process, filesystem)
-│   ├── config/     # config loader
+│   ├── config/     # config loader (now includes daemon + stream)
 │   └── core/       # errors, logging
 └── tests/
 ```
 
 ### Adding a new tool
 
-1. Implement a function returning a `Tool` (see
-   `src/hyusk/tools/filesystem/tools.py`).
-2. Register it from `register_*_tools(registry)` in that module.
-3. Call the registrar in `cli/app.py:build_registry()`.
+1. Implement a function returning a `Tool` (see `tools/filesystem/tools.py`).
+2. Register it from `register_*_tools(registry)`.
+3. Call the registrar in `daemon/registry_builder.py:build_registry()`.
 4. Add a test under `tests/test_<area>.py`.
 
 ### Adding a new LLM provider
 
-Implement `LLMProvider.chat()` in a new file under `src/hyusk/llm/`, then
-add a branch in `cli/app.py:build_provider()`. The agent loop does not need
-to change.
+Implement `LLMProvider.chat()` and (optionally) `chat_stream()` in a new
+file under `src/hyusk/llm/`. Then add a branch in
+`daemon/registry_builder.py:build_provider()`.
 
 ---
 
-## Roadmap
+## Roadmap (V3+)
 
-- Voice / mobile / WebSocket clients (speak to the same daemon).
-- Anthropic-native provider.
+- Voice client (subscribe to daemon over WebSocket, push transcribed audio).
+- Mobile app (iOS/Android) talking to the daemon.
 - Persistent PTY-backed shell sessions.
 - Sandboxed tool execution.
-- Browser automation as an additional tool category.
+- Browser automation as a new tool category.
 - Plugin marketplace.
+- Routing `ask` decisions from the daemon back to the connected client.
 
 See [`docs/architecture.md`](docs/architecture.md) for the architecture
 that makes these possible without rewriting the core.
