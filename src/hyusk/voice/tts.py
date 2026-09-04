@@ -96,7 +96,9 @@ class KittenBackend:
                 from kittentts import KittenTTS
 
                 # The first model load takes a few seconds; we do it once.
-                self._model = KittenTTS("KittenML/kitten-tts-nano-0.1")
+                # KittenTTS() with no args auto-downloads the model from
+                # HuggingFace and caches it under ~/.cache/huggingface.
+                self._model = KittenTTS()
             except Exception as exc:
                 logger.warning("failed to load KittenTTS: %s", exc)
                 raise
