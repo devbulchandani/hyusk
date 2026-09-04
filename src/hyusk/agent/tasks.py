@@ -34,15 +34,18 @@ to itself.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..config.config import Config
 from ..events.events import Event, EventBus
-from ..llm.provider import LLMProvider
+from ..llm.provider import LLMProvider, Message
 from ..permissions.policy import PermissionPolicy
 from ..sessions.session import Session
 from ..tools.registry import ToolRegistry
@@ -60,6 +63,23 @@ class TaskState(StrEnum):
     DONE = "done"
     CANCELLED = "cancelled"
     ERRORED = "errored"
+    # V4: task was running when the daemon restarted. The agent thread is
+    # gone; the user can resume the session manually.
+    INTERRUPTED = "interrupted"
+
+
+def _msg_to_dict(m: Message) -> dict:
+    """Serialize a Message to a JSON-safe dict for the task transcript."""
+    return {
+        "role": m.role,
+        "content": m.content,
+        "tool_calls": [
+            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+            for tc in m.tool_calls
+        ],
+        "tool_call_id": m.tool_call_id,
+        "name": m.name,
+    }
 
 
 @dataclass
@@ -77,6 +97,7 @@ class TaskInfo:
     iterations: int = 0
     error: str | None = None
     cancelled: bool = False
+    transcript: list[dict] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,7 +111,26 @@ class TaskInfo:
             "text": self.text,
             "iterations": self.iterations,
             "error": self.error,
+            "cancelled": self.cancelled,
+            "transcript": self.transcript or [],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TaskInfo:
+        return cls(
+            id=data["id"],
+            session_id=data["session_id"],
+            state=TaskState(data.get("state", "pending")),
+            input=data.get("input", ""),
+            created_at=data.get("created_at", 0.0),
+            started_at=data.get("started_at"),
+            ended_at=data.get("ended_at"),
+            text=data.get("text", ""),
+            iterations=int(data.get("iterations", 0)),
+            error=data.get("error"),
+            cancelled=bool(data.get("cancelled", False)),
+            transcript=data.get("transcript"),
+        )
 
 
 class Task:
@@ -108,6 +148,7 @@ class Task:
         grant_callback,
         model: str,
         max_iterations: int,
+        on_state_change=None,
     ) -> None:
         self.id = task_id
         self.session = session
@@ -142,6 +183,9 @@ class Task:
         self._subscribers: list[Any] = []
         self._sub_lock = threading.Lock()
         self._watcher: threading.Thread | None = None
+        # V4: optional callback invoked on every state change. Used by
+        # TaskManager to persist TaskInfo to disk.
+        self._on_state_change = on_state_change
 
     # ---- lifecycle ----
 
@@ -180,6 +224,9 @@ class Task:
         if result is not None:
             self._result_text = result.text
             self._result_iterations = result.iterations
+            # Update the session BEFORE changing state so any callback
+            # (e.g. the TaskStore snapshot) sees the final messages.
+            self.session.messages = list(result.session_messages)
             if result.cancelled:
                 self._set_state(TaskState.CANCELLED)
                 self._result_cancelled = True
@@ -188,7 +235,6 @@ class Task:
                 self._result_error = result.error
             else:
                 self._set_state(TaskState.DONE)
-            self.session.messages = list(result.session_messages)
             try:
                 self.session.save_self()
             except Exception:
@@ -226,6 +272,11 @@ class Task:
         with self._state_lock:
             self._state = state
             self._info.state = state
+        if self._on_state_change is not None:
+            try:
+                self._on_state_change(self)
+            except Exception:
+                pass
 
     # ---- public API ----
 
@@ -306,8 +357,68 @@ class Task:
                 pass
 
 
+class TaskStore:
+    """Thread-safe persistent storage of TaskInfo records (V4).
+
+    Tasks are written to `<base_dir>/<task_id>.json` so the daemon can
+    restore state across restarts. On startup, the daemon calls
+    `restore()` which loads any persisted tasks that were running and
+    marks them as `interrupted`.
+    """
+
+    def __init__(self, base_dir: str) -> None:
+        self.base_dir = base_dir
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _path(self, task_id: str) -> Path:
+        safe = "".join(c for c in task_id if c.isalnum() or c in "-_")
+        return Path(self.base_dir) / f"{safe}.json"
+
+    def save(self, info: TaskInfo) -> None:
+        path = self._path(info.id)
+        tmp = path.with_suffix(".tmp")
+        with self._lock:
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(info.to_dict(), f, indent=2, default=str)
+            os.replace(tmp, path)
+
+    def load(self, task_id: str) -> TaskInfo | None:
+        path = self._path(task_id)
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as f:
+            return TaskInfo.from_dict(json.load(f))
+
+    def list(self) -> list[TaskInfo]:
+        out: list[TaskInfo] = []
+        with self._lock:
+            for p in Path(self.base_dir).glob("*.json"):
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        out.append(TaskInfo.from_dict(json.load(f)))
+                except Exception:
+                    continue
+        out.sort(key=lambda t: t.created_at, reverse=True)
+        return out
+
+    def delete(self, task_id: str) -> None:
+        path = self._path(task_id)
+        with self._lock:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 class TaskManager:
-    """Owns all background tasks. Thread-safe."""
+    """Owns all background tasks. Thread-safe.
+
+    V4: optionally persists TaskInfo records to a TaskStore so the daemon
+    can restore state across restarts. On startup, the daemon calls
+    `restore()` which loads any persisted tasks that were running and
+    marks them as `interrupted` (we cannot auto-resume a thread).
+    """
 
     def __init__(
         self,
@@ -318,6 +429,7 @@ class TaskManager:
         policy: PermissionPolicy,
         session_dir: str,
         grant_callback=None,
+        store: TaskStore | None = None,
     ) -> None:
         self._cfg = cfg
         self._llm = llm
@@ -325,6 +437,7 @@ class TaskManager:
         self._policy = policy
         self._session_dir = session_dir
         self._grant_callback = grant_callback
+        self._store = store
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
 
@@ -353,14 +466,73 @@ class TaskManager:
             grant_callback=self._grant_callback,
             model=self._cfg.llm.model,
             max_iterations=self._cfg.agent.max_iterations,
+            on_state_change=self._on_task_state_change if self._store else None,
         )
         with self._lock:
             self._tasks[task_id] = task
         if pre_subscribers:
             with task._sub_lock:  # noqa: SLF001
                 task._subscribers.extend(pre_subscribers)  # noqa: SLF001
+        if self._store is not None:
+            self._store.save(self._snapshot(task))
         task.start()
         return task
+
+    def _on_task_state_change(self, task: Task) -> None:
+        """Hook called by Task on every state transition."""
+        if self._store is not None:
+            self._store.save(self._snapshot(task))
+
+    def _snapshot(self, task: Task) -> TaskInfo:
+        info = task.info()
+        # Capture a transcript of the current messages so we can inspect
+        # the task after a restart.
+        try:
+            transcript = [_msg_to_dict(m) for m in task.session.messages]
+        except Exception:
+            transcript = []
+        return TaskInfo(
+            id=info.id,
+            session_id=info.session_id,
+            state=info.state,
+            input=info.input,
+            created_at=info.created_at,
+            started_at=info.started_at,
+            ended_at=info.ended_at,
+            text=info.text,
+            iterations=info.iterations,
+            error=info.error,
+            cancelled=info.cancelled,
+            transcript=transcript,
+        )
+
+    def restore(self) -> int:
+        """Reload persisted tasks and mark any that were running as
+        `interrupted`. Returns the number of tasks restored."""
+        if self._store is None:
+            return 0
+        loaded = self._store.list()
+        restored = 0
+        for info in loaded:
+            if info.state in (TaskState.RUNNING, TaskState.PENDING):
+                info.state = TaskState.INTERRUPTED
+                info.error = (info.error or "") + " [interrupted by daemon restart]"
+                self._store.save(info)
+            restored += 1
+        return restored
+
+    def delete(self, task_id: str) -> bool:
+        with self._lock:
+            t = self._tasks.get(task_id)
+        if t is None:
+            # Even if no in-memory task, the record may be on disk.
+            if self._store is not None:
+                self._store.delete(task_id)
+            return True
+        t.cancel()
+        if self._store is not None:
+            self._store.delete(task_id)
+        return True
 
     def get(self, task_id: str) -> Task | None:
         with self._lock:
