@@ -371,6 +371,9 @@ def _normalize_argv(argv: list[str] | None) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import sys as _sys
+    if argv is None:
+        argv = _sys.argv[1:]
     parser = build_parser()
     args = parser.parse_args(_normalize_argv(argv))
     cfg = Config.load()
