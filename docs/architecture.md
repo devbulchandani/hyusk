@@ -1,28 +1,23 @@
 # Hyusk Architecture
 
-This document describes the major interfaces and boundaries in Hyusk V2.
-V1 already laid out the core (errors, events, tools, permissions, agent
-loop, sessions, platform, LLM abstraction). V2 layers a daemon +
-WebSocket transport and streaming LLM responses on top — without
-changing the core.
+This document describes the major interfaces and boundaries in Hyusk V3.
+V1 laid out the core (errors, events, tools, permissions, agent loop,
+sessions, platform, LLM abstraction). V2 layered a daemon + WebSocket
+transport and streaming LLM responses. V3 layers **concurrent agent runs
+with steering and cancellation** on top — without changing the core.
 
 ## Goals
 
-V1 goals still apply:
-
 1. A clean local CLI agent today (no daemon required).
 2. A core that does not depend on any single model provider.
-3. A core that does not depend on any single OS, but has explicit platform
-   abstractions so additional platforms are additive.
-
-V2 goals:
-
-4. The CLI should be a **thin client** that talks to a long-running
-   daemon when one is available.
+3. A core that does not depend on any single OS, but has explicit
+   platform abstractions so additional platforms are additive.
+4. The CLI is a thin client that talks to a long-running daemon.
 5. Future clients (mobile, voice, remote, WebSocket) plug in without
    touching the core.
-6. The agent loop should be **streaming-aware**: providers that support
-   SSE should drive text deltas into the event bus in real time.
+6. The agent loop is streaming-aware.
+7. **The user can run multiple tasks in parallel and steer them.**
+   The CLI stays responsive even while long tasks run.
 
 ## High-level shape
 
@@ -40,9 +35,9 @@ V2 goals:
                           │
        ┌──────────────────┼──────────────────┐
        ▼                  ▼                  ▼
-   CLI (V1+V2)     Voice (V3)         Mobile (V3)
+   CLI (V3)         Voice (V4)         Mobile (V4)
    WebSocket         WebSocket          WebSocket
-   client            client             client
+   client             client             client
        │                  │                  │
        └──────────────────┼──────────────────┘
                           │
@@ -50,163 +45,145 @@ V2 goals:
                 ┌─────────────────────┐
                 │   HYUSK DAEMON      │
                 │   WebSocket server  │
-                │   (V2)              │
-                └─────────────────────┘
+                │   (V3: concurrent   │
+                │    tasks + ask      │
+                │    routing)         │
+                └─────────┬───────────┘
                           │
                           ▼
                 ┌─────────────────────┐
-                │   PROVIDERS         │
-                │   OpenAI-compat     │
-                │   Anthropic         │
-                │   (V2)              │
+                │   TASK MANAGER      │
+                │   (V3)              │
+                │  Owns a thread per  │
+                │  task. Each task    │
+                │  has its own        │
+                │  Agent, session,    │
+                │  and event stream.  │
                 └─────────────────────┘
 ```
 
-The dashed boxes above the core are V2+ clients. The daemon speaks a
-small JSON protocol; the V2 CLI is one of those clients.
+## V3 deltas
 
-## V2 deltas
+### `agent/tasks.py` — TaskManager
 
-### `daemon/` — WebSocket server
+The single most important V3 addition. A `TaskManager` owns a registry of
+`Task` objects. Each `Task` runs `Agent.run()` in its own thread with its
+own `EventBus`. Tasks can run concurrently without blocking each other.
 
-`daemon/server.py` runs an asyncio WebSocket server. It owns a
-`DaemonContext` containing the registry, policy, LLM, and session
-directory. It uses `websockets` (only V2 runtime dep).
+Public API:
 
-Protocol messages (`client → server` and `server → client`) are documented
-in `README.md`. The protocol is intentionally tiny — there is no separate
-streaming message type; events already stream because each one is its
-own JSON message.
+- `TaskManager.submit(input_text=..., session=...)` — start a new task.
+  Returns a `Task` handle. The agent begins running immediately.
+- `Task.steer(message)` — queue a follow-up user message. The agent loop
+  drains the queue between tool calls.
+- `Task.cancel()` — request cancellation. The agent loop checks the
+  cancel flag at safe points (between LLM calls, between tool calls).
+- `Task.events()` — return a `(queue, unsubscribe)` pair. The queue
+  receives every event the agent publishes. Safe to call before or
+  after the task starts.
+- `Task.info()` / `Task.result(timeout=None)` — snapshot the task state
+  or block until it finishes.
 
-`run_session()` uses `EventStream` (in `agent/loop.py`) to consume the
-agent's events on a reader thread, then forwards them to the WebSocket
-from the asyncio loop via a queue. This avoids `run_in_executor` traps
-(StopIteration).
+**V3 design choice (and why we did it this way):** the Task has its own
+internal subscribers list rather than routing events through the agent's
+bus. The agent's bus already has a subscriber (the EventStream's
+`on_event`) that puts events into the EventStream's queue. If we added
+the daemon's queue subscriber directly to the bus, broadcasts would
+trigger feedback loops (the queue subscriber would re-enqueue events
+that the EventStream was also trying to deliver). The Task's separate
+list, fed by the watcher thread that consumes the EventStream, avoids
+this.
 
-Lifecycle:
+### `agent/loop.py` — steering + cancellation
 
-- `pid_file()` writes the daemon PID to `<config>/daemon.pid`.
-- `is_running()` checks if the PID is alive.
-- `serve_forever()` is the foreground entry; `cli/app.py` calls it from
-  `hyusk --daemon-action start`.
-- `hyusk --daemon-action stop` sends SIGTERM and waits for the pid file
-  to be cleared.
+The agent loop now:
 
-### `client/` — WebSocket client
+- Calls `self._drain_steering(messages)` at the top of each iteration.
+  This appends any queued follow-up user messages to the conversation.
+- Checks `self._cancelled.is_set()` at the start of each iteration and
+  between tool calls. The current tool call is allowed to finish; we do
+  not interrupt it (that would require provider-specific cancellation
+  which is V4 work).
+- In streaming mode, also breaks out of the stream loop on cancel so
+  the LLM call returns early.
 
-`client/client.py` exposes `run_over_daemon_sync()` and
-`list_sessions_sync()`. The CLI uses these when the daemon is
-reachable. The CLI replays the collected events through the same
-`_render_event()` function used in-process, so the user experience is
-identical whether the daemon is running or not.
+`AgentLoopLimit` still propagates to callers (V2 contract preserved).
+The `Task` wrapper catches it and sets state to `errored`.
 
-### `llm/provider.py` — streaming
+### `daemon/server.py` — V3 protocol
 
-`LLMProvider` now also exposes `chat_stream()`. It yields
-`LLMChunk(text_delta=..., tool_call_delta=..., done=..., response=...)`.
-The default `chat_stream()` simply wraps `chat()` and yields a single
-`done` chunk, so providers that do not override it still work.
+The WebSocket protocol gained:
 
-`LLMChunk` has:
+- `{"type": "run", ...}` now returns a `{"type": "task", "task_id": "...",
+  "session_id": "..."}` message immediately, then streams events. The
+  events are tagged with the `task_id` so multiple concurrent tasks can
+  be multiplexed by the client.
+- `{"type": "list_tasks"}` returns the current task list.
+- `{"type": "cancel", "task_id": "..."}` cancels a task.
+- `{"type": "steer", "task_id": "...", "input": "..."}` injects a
+  follow-up user message.
+- `{"type": "ask", ...}` is sent to the client that started the task
+  when the policy says `ask`. The client replies with
+  `{"type": "grant", "ask_id": "...", "granted": bool}`.
 
-- `text_delta`: a partial text fragment.
-- `tool_call_delta`: an optional partial or complete `ToolCallRequest`.
-- `done`: signals the final chunk; `response` holds the complete
-  `LLMResponse`.
+The daemon's `TaskManager` is created once at startup and shared by
+all clients. Concurrent clients can submit, steer, and cancel tasks
+independently.
 
-### `llm/openai_compat.py` — real SSE streaming
+### `client/client.py` — V3 client
 
-V2 implements proper SSE streaming against `/chat/completions?stream=true`.
-It accumulates text deltas into `accumulated_text` and tool call JSON
-into `tool_state`. When the stream ends, the final `LLMResponse` is
-yielded as a `done` chunk.
+The WebSocket client gained:
 
-### `llm/anthropic.py` — new in V2
+- A `DaemonClient` class that maintains a persistent connection and
+  exposes `submit`, `cancel`, `steer`, `list_tasks`, `wait_done`,
+  plus `on_event`, `on_ask`, `on_done`, `on_error` callbacks.
+- `run_over_daemon_sync()` for one-shot use (the CLI uses it for
+  one-shot commands).
 
-Anthropic Messages API provider, streaming + non-streaming. Uses
-`urllib` so there is no SDK dependency.
+### `cli/app.py` — V3 REPL
 
-Differences vs OpenAI:
+The REPL gained:
 
-- System messages are a top-level `system` field, not a message.
-- Tools use `input_schema` directly (no `function` wrapper).
-- Tool calls are `tool_use` content blocks; tool results are
-  `tool_result` blocks in a user message.
-- The streaming protocol uses `event:` lines with types
-  `message_start`, `content_block_start`, `content_block_delta`,
-  `content_block_stop`, `message_delta`, `message_stop`, `ping`.
+- `bg: <prompt>` — start a background task without waiting.
+- `steer <id> <message>` — inject a follow-up.
+- `cancel <id>` — cancel a running task.
+- `tasks` — list active and recent tasks.
 
-`_convert_messages()` translates between Hyusk's OpenAI-style
-`role=tool` messages and Anthropic's `tool_result` blocks.
+The `_render_event()` helper now prefixes output with `[task_id]` so
+output from background tasks is distinguishable from foreground output.
+In the daemon-backed REPL, all events from all running tasks are
+rendered live.
 
-### `agent/loop.py` — streaming-aware
+### `sessions/store.py` — SessionStore
 
-The agent loop detects whether the LLM provider overrides
-`chat_stream()`. If it does, the loop consumes the stream and emits one
-`AGENT_TEXT` event per text chunk with `delta=True`. If it does not, the
-loop falls back to `chat()` and emits one `AGENT_TEXT` event with
-`delta=False`. CLI renderers use the `delta` flag to decide between
-"streamed partial" and "complete response".
+A small wrapper that knows the base directory for sessions. Each
+`Task` holds a `Session` whose `metadata["_store_dir"]` is set by the
+store, so the Task can save the session without re-passing the
+directory.
 
-A new `EventStream` class runs the agent in a background thread and
-yields events from the calling thread. Transports (the daemon) consume
-it through a queue.
-
-### `cli/app.py` — client + daemon subcommands
-
-- `hyusk [PROMPT]` — REPL or one-shot.
-- `hyusk --daemon-action start|stop|status` — daemon lifecycle.
-- `hyusk --list-sessions` — list sessions (asks the daemon if reachable,
-  falls back to local listing).
-- `hyusk --no-daemon` — force in-process agent.
-- `hyusk --daemon-only` — fail if the daemon is unreachable.
-
-If a prompt is supplied, the CLI uses `_run_one_shot()`. If not, it
-uses `_run_repl()`. Both have `_via_daemon` and in-process variants;
-the same `_render_event()` is used in both modes.
-
-Legacy `hyusk daemon start` / `hyusk sessions` syntax is accepted
-through `_normalize_argv()` and translated into flag form.
-
-## Core modules (V1, unchanged)
+## V1 + V2 modules (unchanged)
 
 ### `core/errors.py` — typed errors
 
-All Hyusk-specific errors subclass `HyuskError`. The agent and the
-daemon translate them into friendly messages. Generic exceptions are
-never silently swallowed.
+`HyuskError` is the base. Subclasses: `ToolNotFound`, `PermissionDenied`,
+`CommandFailed`, `Timeout`, `UnsupportedPlatform`, `FileNotFound`,
+`InvalidInput`, `ProviderError`, `AgentLoopLimit`, `AgentCancelled`,
+`AgentSteered`.
 
 ### `events/events.py` — typed event bus
 
-The event bus is the only seam between the agent and any transport.
-V2 does not add new event types; existing ones already cover what the
-daemon needs:
+`EventBus` is a synchronous pub/sub. `EventType` enum covers what the
+agent and daemon need. V3 does not add new event types; existing ones
+already cover concurrent task flows.
 
-| Event              | Data                                         |
-|--------------------|---------------------------------------------|
-| `agent.started`    | message count                               |
-| `agent.thinking`   | iteration number                            |
-| `agent.text`       | `{delta: bool, text: str}`                  |
-| `agent.tool_call`  | available tool names                        |
-| `tool.started`     | `{name, arguments}`                         |
-| `tool.completed`   | `{name, duration_ms, error}`                |
-| `agent.completed`  | `{iterations, text_chars}`                  |
-| `agent.error`      | `{error}`                                   |
+### `llm/` — providers
 
-### `llm/provider.py` — LLM abstraction
+`LLMProvider.chat()` is the canonical contract. `chat_stream()` yields
+`LLMChunk(text_delta, tool_call_delta, done, response)` for streaming
+support. V2 added `OpenAICompatProvider.chat_stream()` and the
+`AnthropicProvider`. V3 doesn't change these.
 
-```python
-class LLMProvider(abc.ABC):
-    name: str
-    def chat(self, messages, tools=None, *, model=None, temperature=None) -> LLMResponse: ...
-    def chat_stream(self, messages, tools=None, *, model=None, temperature=None) -> Iterator[LLMChunk]: ...
-```
-
-V2 still keeps `chat()` as the canonical contract. New providers must
-implement `chat()` and should override `chat_stream()` for real-time
-rendering.
-
-### `tools/` — tools
+### `tools/` — tool base + registry
 
 A `Tool` is a data record: name, description, JSON-schema input,
 permission category, `execute()` callable. The agent discovers tools
@@ -214,34 +191,26 @@ through `ToolRegistry`; never hardcoded.
 
 ### `permissions/policy.py`
 
-`PermissionPolicy` produces `allow`/`deny`/`ask` per call. Destructive
-tools always require interactive confirmation by default. The CLI
-prompts; the daemon currently grants all `ask` calls (a future version
-can route them back to the connected client).
-
-### `sessions/session.py`
-
-A `Session` is `{id, messages, created_at, metadata}`, persisted as
-JSON. The daemon uses the same `Session.load()` / `Session.save()` that
-the in-process CLI does.
+`PermissionPolicy` produces `allow` / `deny` / `ask` per call. The
+daemon routes `ask` to the originating client.
 
 ### `platform/`
 
-OS abstractions for shell, process, and filesystem. Windows
-`ProcessManager` returns structured `UnsupportedPlatform` errors.
+OS abstractions: `Shell` (subprocess), `ProcessManager` (Posix +
+Windows stubs), `filesystem` helpers.
 
-## V3+ paths (still no rewrite needed)
+## V4+ paths (still no rewrite needed)
 
-| V3+ feature              | Hook                                        |
+| V4+ feature              | Hook                                        |
 |--------------------------|---------------------------------------------|
-| Mobile client            | WebSocket protocol already documented       |
+| Mobile client            | WebSocket protocol already supports all flows |
 | Voice client             | Same protocol; push transcribed text into `run` |
 | Persistent PTY shell     | swap `platform.shell.make_shell` factory    |
-| Real Windows processes   | add `platform/windows/...` and update the factory |
-| Routing ask decisions    | extend `_run_session` to forward ask events |
+| Real Windows processes   | add `platform/windows/...`                  |
+| Streaming cancellations  | provider-specific mid-stream abort          |
 | Plugin marketplace       | dynamic Tool loading via the registry       |
 | Sandboxing               | wrap `Tool.run` in a sandboxed executor     |
-| Remote daemon            | add auth layer; WebSocket protocol unchanged|
+| Remote daemon            | add auth layer; protocol unchanged          |
 | Multi-tenant daemon      | namespace sessions per client token         |
 
-All of these only add code. Nothing in the V1/V2 core needs to change.
+All of these only add code. Nothing in V1/V2/V3 needs to change.

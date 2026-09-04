@@ -1,12 +1,26 @@
 """Agent loop.
 
 Turns a user message into a series of LLM calls, tool executions, and a
-final answer. Emits events so the CLI (and V2 transports) can render
+final answer. Emits events so the CLI (and V2/V3 transports) can render
 progress in real time.
 
-V2: when the LLM provider supports `chat_stream`, the agent loop uses it
-and emits AGENT_TEXT with `delta=True` for each chunk. Non-streaming
-providers fall back to a single AGENT_TEXT with `delta=False`.
+V2 features:
+  - When the LLM provider supports `chat_stream`, the agent loop uses it
+    and emits AGENT_TEXT with `delta=True` for each chunk. Non-streaming
+    providers fall back to a single AGENT_TEXT with `delta=False`.
+
+V3 features:
+  - Concurrent runs are not blocked by each other. Each Agent has its
+    own thread, its own EventBus, and its own session_messages buffer.
+  - Steering: a host can call `agent.inject_steering("...")` to queue
+    a follow-up user message. The agent loop drains the queue between
+    tool calls (i.e. before the next LLM call) and appends the message
+    to the conversation. The current tool call is **not** interrupted.
+  - Cancellation: `agent.cancel()` sets a flag. The agent loop checks
+    the flag between tool calls and between LLM calls. The current
+    streaming LLM call is **not** aborted (that would require provider-
+    specific cancellation); instead, the loop exits as soon as the call
+    returns and the run completes with state="cancelled".
 
 Safeguards:
   - max_iterations prevents runaway loops
@@ -17,11 +31,12 @@ Safeguards:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from ..core.errors import AgentLoopLimit
+from ..core.errors import AgentCancelled, AgentLoopLimit
 from ..events.events import Event, EventBus, EventType
 from ..llm.provider import LLMProvider, LLMResponse, Message, ToolCallRequest, ToolSpec
 from ..permissions.policy import PermissionPolicy
@@ -37,6 +52,10 @@ explain what you are about to do before calling a tool.
 
 When you have enough information, give a concise final answer. Do not call
 tools when a direct answer is possible.
+
+You may receive follow-up instructions from the user while a previous
+task is in progress. Treat them as new directives: acknowledge them
+briefly, then continue with the most useful action.
 """
 
 
@@ -45,6 +64,12 @@ class AgentResult:
     text: str
     iterations: int
     session_messages: list[Message]
+    cancelled: bool = False
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
 
 GrantCallback = Callable[[str, dict], bool]
@@ -69,17 +94,35 @@ class Agent:
         self.model = model
         self.max_iterations = max_iterations
         self.grant_callback = grant_callback
-        # True if the provider implements real streaming.
-        # Detect real streaming: providers override chat_stream.
-        # If the provider doesn't subclass LLMProvider at all, fall back
-        # to non-streaming (the default chat_stream just yields once).
+        # V3: thread-safe steering queue and cancel flag.
+        self._steering: list[str] = []
+        self._steering_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        # Streaming detection (unchanged from V2).
         try:
             cls = type(llm)
             self._supports_streaming = cls.chat_stream is not LLMProvider.chat_stream
         except AttributeError:
             self._supports_streaming = False
 
-    # ---- public entry points ----
+    # ---- public API ----
+
+    def inject_steering(self, message: str) -> None:
+        """Queue a follow-up user message. The agent will see it after the
+        current tool call (or before the next LLM call if no tool is running)."""
+        if not message:
+            return
+        with self._steering_lock:
+            self._steering.append(message)
+        self._emit(EventType.AGENT_TEXT, {"delta": False, "text": "\n[steer queued]\n"})
+
+    def cancel(self) -> None:
+        """Request cancellation. The loop checks this flag between LLM/tool calls."""
+        self._cancelled.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
 
     def run(
         self,
@@ -105,73 +148,119 @@ class Agent:
 
         iterations = 0
         final_text = ""
+        result_error: str | None = None
+        cancelled = False
 
-        while iterations < self.max_iterations:
-            iterations += 1
-            self._emit(EventType.AGENT_THINKING, {"iteration": iterations})
+        try:
+            while iterations < self.max_iterations:
+                if self._cancelled.is_set():
+                    cancelled = True
+                    break
 
-            if self._supports_streaming:
-                response = self._stream_chat(messages, tool_specs)
-            else:
-                response = self.llm.chat(messages, tools=tool_specs, model=self.model or None)
+                # Drain steering messages between iterations.
+                self._drain_steering(messages)
+
+                iterations += 1
+                self._emit(EventType.AGENT_THINKING, {"iteration": iterations})
+
+                if self._supports_streaming:
+                    response = self._stream_chat(messages, tool_specs)
+                else:
+                    response = self.llm.chat(messages, tools=tool_specs, model=self.model or None)
+                    if response.text:
+                        self._emit(EventType.AGENT_TEXT, {"delta": False, "text": response.text})
+
                 if response.text:
-                    self._emit(EventType.AGENT_TEXT, {"delta": False, "text": response.text})
+                    final_text = response.text
 
-            if response.text:
-                final_text = response.text
+                if not response.wants_tool:
+                    break
 
-            if not response.wants_tool:
-                break
-
-            messages.append(
-                Message(
-                    role="assistant",
-                    content=response.text or "",
-                    tool_calls=list(response.tool_calls),
+                messages.append(
+                    Message(
+                        role="assistant",
+                        content=response.text or "",
+                        tool_calls=list(response.tool_calls),
+                    )
                 )
-            )
-            for tc in response.tool_calls:
-                self._handle_tool_call(tc, messages)
+                for tc in response.tool_calls:
+                    if self._cancelled.is_set():
+                        cancelled = True
+                        break
+                    self._handle_tool_call(tc, messages)
+                if cancelled:
+                    break
 
-        if iterations >= self.max_iterations and final_text == "":
-            raise AgentLoopLimit(f"reached max iterations ({self.max_iterations})")
+            if iterations >= self.max_iterations and final_text == "" and not cancelled:
+                raise AgentLoopLimit(f"reached max iterations ({self.max_iterations})")
+        except AgentCancelled:
+            cancelled = True
+        except AgentLoopLimit:
+            # V2 contract: AgentLoopLimit propagates so callers can detect
+            # hard limits. V3 callers (Task) handle this explicitly.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            result_error = f"{type(exc).__name__}: {exc}"
+            self._emit(EventType.AGENT_ERROR, {"error": result_error})
 
         self._emit(
             EventType.AGENT_COMPLETED,
-            {"iterations": iterations, "text_chars": len(final_text)},
+            {
+                "iterations": iterations,
+                "text_chars": len(final_text),
+                "cancelled": cancelled,
+                "error": result_error,
+            },
         )
-        return AgentResult(text=final_text, iterations=iterations, session_messages=messages)
+        return AgentResult(
+            text=final_text,
+            iterations=iterations,
+            session_messages=messages,
+            cancelled=cancelled,
+            error=result_error,
+        )
 
-    # ---- streaming ----
+    # ---- internals ----
+
+    def _drain_steering(self, messages: list[Message]) -> None:
+        with self._steering_lock:
+            pending = list(self._steering)
+            self._steering.clear()
+        for msg in pending:
+            messages.append(Message(role="user", content=msg))
+            self._emit(EventType.AGENT_TEXT, {"delta": False, "text": f"\n[steer] {msg}\n"})
 
     def _stream_chat(self, messages: list[Message], tool_specs: list[ToolSpec]) -> LLMResponse:
-        """Run chat_stream and emit one AGENT_TEXT per text chunk.
-
-        Falls back to chat() if the provider raises NotImplementedError
-        (e.g. a custom subclass without streaming support).
-        """
+        """Run chat_stream and emit one AGENT_TEXT per text chunk."""
         final: LLMResponse | None = None
         try:
             stream = self.llm.chat_stream(messages, tools=tool_specs, model=self.model or None)
         except NotImplementedError:
             return self.llm.chat(messages, tools=tool_specs, model=self.model or None)
         for chunk in stream:
+            if self._cancelled.is_set():
+                # Stop consuming the stream; whatever we've got is the final.
+                break
             if chunk.text_delta:
                 self._emit(EventType.AGENT_TEXT, {"delta": True, "text": chunk.text_delta})
             if chunk.done:
                 final = chunk.response
         if final is None:
-            # Provider ended without `done`; one-shot fallback.
             return self.llm.chat(messages, tools=tool_specs, model=self.model or None)
         return final
-
-    # ---- tool calls ----
 
     def _handle_tool_call(self, tc: ToolCallRequest, messages: list[Message]) -> None:
         if not self.registry.has(tc.name):
             err = {"error": f"unknown tool: {tc.name}"}
             self._emit(EventType.TOOL_COMPLETED, {"name": tc.name, "error": err["error"]})
-            messages.append(Message(role="tool", name=tc.name, tool_call_id=tc.id, content=json.dumps(err)))
+            messages.append(
+                Message(
+                    role="tool",
+                    name=tc.name,
+                    tool_call_id=tc.id,
+                    content=json.dumps(err),
+                )
+            )
             return
 
         tool = self.registry.get(tc.name)
@@ -180,7 +269,14 @@ class Agent:
         if decision.action == "deny":
             err = {"error": decision.reason or "denied"}
             self._emit(EventType.TOOL_COMPLETED, {"name": tc.name, "error": err["error"]})
-            messages.append(Message(role="tool", name=tc.name, tool_call_id=tc.id, content=json.dumps(err)))
+            messages.append(
+                Message(
+                    role="tool",
+                    name=tc.name,
+                    tool_call_id=tc.id,
+                    content=json.dumps(err),
+                )
+            )
             return
 
         if decision.action == "ask":
@@ -226,41 +322,25 @@ class Agent:
         self.bus.publish(Event(type=event_type, data=data))
 
 
-def iter_events(bus: EventBus) -> Iterator[Event]:
-    """Subscribe to all events and yield them as they arrive.
-
-    This is the V2 transport hook: the daemon wraps an Agent.run() in
-    `iter_events()` and forwards each Event as a JSON message over
-    WebSocket.
-    """
-    queue: list[Event] = []
-    done = {"v": False}
-
-    def on_event(ev: Event) -> None:
-        queue.append(ev)
-
-    unsub = bus.subscribe(on_event)
-    try:
-        while not done["v"]:
-            if queue:
-                yield queue.pop(0)
-            else:
-                time.sleep(0.005)
-    finally:
-        unsub()
+def events_to_messages(
+    agent: Agent,
+    messages: list[Message],
+    *,
+    user_input: str | None,
+) -> EventStream:
+    """Run the agent in a background thread; returns an EventStream."""
+    return EventStream(agent, messages, user_input=user_input)
 
 
 class EventStream:
     """Runs an Agent.run() in a background thread and yields its events.
 
-    Used by transports (V2 daemon WebSocket handler) that need to consume
+    Used by transports (V2/V3 daemon WebSocket handler) that need to consume
     the agent's event stream from another thread without coupling to the
     Agent's lifetime directly.
     """
 
     def __init__(self, agent: Agent, messages: list[Message], *, user_input: str | None) -> None:
-        import threading
-
         self._queue: list[Event] = []
         self._lock = threading.Lock()
         self._done = False
@@ -304,13 +384,3 @@ class EventStream:
     @property
     def result(self) -> AgentResult | None:
         return self._result
-
-
-def events_to_messages(
-    agent: Agent,
-    messages: list[Message],
-    *,
-    user_input: str | None,
-) -> EventStream:
-    """Run the agent in a background thread; returns an EventStream."""
-    return EventStream(agent, messages, user_input=user_input)

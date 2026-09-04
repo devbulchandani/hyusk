@@ -57,3 +57,11 @@ class ProviderError(HyuskError):
 
 class AgentLoopLimit(HyuskError):
     """Raised when the agent exceeds its configured iteration cap."""
+
+
+class AgentCancelled(HyuskError):
+    """Raised when an agent run is cancelled by the user/host."""
+
+
+class AgentSteered(HyuskError):
+    """Raised internally when a steering message is injected mid-loop."""
