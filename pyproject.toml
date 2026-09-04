@@ -1,6 +1,6 @@
 [project]
 name = "hyusk"
-version = "0.1.0"
+version = "0.5.0"
 description = "Hyusk: a cross-platform computer agent."
 readme = "README.md"
 authors = [
@@ -30,29 +30,28 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
 ]
+# All-in-one install for voice I/O.
 voice = [
     "sounddevice>=0.4",
     "numpy>=1.20",
     "scipy>=1.10",
 ]
+# Local TTS: Kokoro (recommended, cross-platform) + macOS `say` zero-dep
 tts = [
-    "httpx>=0.27",
-    "kittentts>=0.1; sys_platform == 'darwin'",
+    "kokoro-onnx>=0.6",
+    "soundfile>=0.12",
 ]
+# Local STT: whisper.cpp via pywhispercpp
 stt = [
-    "mlx-whisper>=0.4; sys_platform == 'darwin'",
-    "openai-whisper>=20231117; sys_platform != 'darwin'",
-    "scipy>=1.10",
+    "pywhispercpp>=1.4",
 ]
+# Cloud TTS/STT (optional, requires API key)
 tts-cloud = [
-    "openai>=1.0",
+    "httpx>=0.27",
 ]
+# Everything for local voice (TTS + STT + audio I/O)
 mic = [
-    "sounddevice>=0.4",
-    "numpy>=1.20",
-    "scipy>=1.10",
-    "mlx-whisper>=0.4; sys_platform == 'darwin'",
-    "openai-whisper>=20231117; sys_platform != 'darwin'",
+    "hyusk[voice,tts,stt]",
 ]
 all = [
     "hyusk[voice,tts,stt,tts-cloud]",
