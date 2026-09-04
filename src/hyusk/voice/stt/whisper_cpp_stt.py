@@ -38,7 +38,7 @@ logger = logging.getLogger("hyusk.voice.stt.whisper_cpp")
 # Default model — small, English-only, fast enough for real-time.
 DEFAULT_MODEL = "base.en"
 DEFAULT_LANGUAGE = "en"
-DEFAULT_N_THREADS = 0  # 0 = auto
+DEFAULT_N_THREADS = 4  # pywhispercpp 1.5.x with n_threads=0 (auto) triggers a "vector" exception on M1; use 4 explicitly
 
 
 class WhisperCppSTT:
@@ -88,7 +88,9 @@ class WhisperCppSTT:
                 self._model = Model(
                     self._model_name,
                     print_progress=False,
-                    n_threads=self._n_threads,
+                    # pywhispercpp 1.5.x with n_threads=0 (auto) triggers a
+                    # "vector" exception on M1. Use 4 explicitly.
+                    n_threads=self._n_threads if self._n_threads > 0 else 4,
                 )
             except Exception as exc:
                 logger.warning("failed to load whisper.cpp model %r: %s", self._model_name, exc)

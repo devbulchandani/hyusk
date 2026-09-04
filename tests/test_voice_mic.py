@@ -79,3 +79,18 @@ def test_whisper_cpp_backend_uses_configured_model(monkeypatch):
     monkeypatch.setenv("HYUSK_WHISPER_MODEL", "tiny")
     b = WhisperCppSTT()
     assert b._model_name == "tiny"
+
+
+def test_whisper_cpp_backend_uses_n_threads_not_zero():
+    """Regression: pywhispercpp 1.5.x with n_threads=0 (auto) triggers a
+    C++ "vector" exception on Apple Silicon. The backend should never
+    pass n_threads=0 to the Model constructor; it should use 4 (or the
+    user-supplied value) explicitly.
+    """
+    b = WhisperCppSTT(model="tiny")
+    # The internal n_threads should never be 0 (auto), because that
+    # is what triggers the bug. Either 4 (default) or the user's value.
+    assert b._n_threads >= 1, (
+        f"n_threads should be >=1, got {b._n_threads}. "
+        "n_threads=0 (auto) triggers a known whisper.cpp crash."
+    )
