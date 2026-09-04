@@ -57,7 +57,7 @@ from ..sessions.store import SessionStore
 
 
 def _in_process_agent(cfg: Config, *, no_confirm: bool) -> Agent:
-    registry = build_registry()
+    registry = build_registry(load_user_plugins=True)
     policy = build_policy(cfg)
     bus = EventBus()
     provider = build_provider(cfg)
@@ -482,7 +482,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hyusk",
-        description="Cross-platform computer agent (V3: concurrent tasks, daemon, streaming).",
+        description="Cross-platform computer agent (V4: persistent tasks, voice client, daemon, streaming).",
     )
     parser.add_argument(
         "prompt",
@@ -513,6 +513,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Manage the local daemon (start|stop|status).",
     )
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Run a voice/text client against the daemon.",
+    )
+    parser.add_argument("--text", action="store_true", help="(voice) Read input from stdin.")
+    parser.add_argument("--mic", action="store_true", help="(voice) Capture from microphone.")
+    parser.add_argument("--host", default=None, help="(voice) Daemon host.")
+    parser.add_argument("--port", type=int, default=None, help="(voice) Daemon port.")
+    parser.add_argument("--no-tts", action="store_true", help="(voice) Do not use TTS.")
     return parser
 
 
@@ -535,6 +545,23 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.load()
     if args.model:
         cfg.llm.model = args.model
+
+    if args.voice:
+        from ..voice.client import main as _voice_main
+        voice_args: list[str] = []
+        if args.text:
+            voice_args.append("--text")
+        if args.mic:
+            voice_args.append("--mic")
+        if args.model:
+            voice_args.extend(["--model", args.model])
+        if args.host:
+            voice_args.extend(["--host", args.host])
+        if args.port:
+            voice_args.extend(["--port", str(args.port)])
+        if args.no_tts:
+            voice_args.append("--no-tts")
+        return _voice_main(voice_args)
 
     if args.daemon_action:
         return _cmd_daemon(argparse.Namespace(daemon_action=args.daemon_action))
