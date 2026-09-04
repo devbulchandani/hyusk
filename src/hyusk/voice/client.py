@@ -167,7 +167,7 @@ async def _run_mic_mode(
     """Mic mode: record, transcribe, submit."""
     # Build the STT backend once.
     import tomllib
-    from pathlib import Path
+    from pathlib import Path  # noqa: F401  (kept for future use)
 
     stt_name = "text"
     try:
@@ -179,12 +179,26 @@ async def _run_mic_mode(
         pass
 
     backend = stt.select_backend(stt_name)
-    if not backend.is_available() or backend.name() == "text":
+    # If the user asked for an STT backend but it's not available (e.g.
+    # they requested mlx-whisper but didn't `uv pip install mlx-whisper`),
+    # explain the situation clearly. If they got the default "text" or
+    # explicitly asked for "text", we just go to stdin without comment.
+    if backend.name() == "text" and stt_name not in ("", "text"):
         print(
-            f"[voice] STT backend {stt_name!r} not available; using stdin.",
+            f"[voice] STT backend {stt_name!r} not installed; falling back to text mode.",
             file=sys.stderr,
         )
-        return await _run_text_mode(client, model, tts_backend)
+        print(
+            "        hint: install with `uv pip install mlx-whisper` (macOS) "
+            "or `uv pip install openai-whisper`",
+            file=sys.stderr,
+        )
+    elif not backend.is_available():
+        print(
+            f"[voice] STT backend {backend.name()} not available; falling back to text mode.",
+            file=sys.stderr,
+        )
+    return await _run_text_mode(client, model, tts_backend)
 
     print("connected (mic mode); speak and press Enter to send. Ctrl-D to exit.", flush=True)
     while True:

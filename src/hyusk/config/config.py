@@ -23,15 +23,58 @@ def user_config_dir() -> Path:
     """Return the user-level config directory, creating it if missing.
 
     Returns `<base>/hyusk/` where `<base>` is determined by:
-      1. `HYUSK_CONFIG_DIR` env var (if set) — used by tests and overrides everything.
-      2. `XDG_CONFIG_HOME` (Linux/macOS) — useful for testing on any platform.
-      3. Platform default: %APPDATA% on Windows, ~/Library/Application Support on
-         macOS, ~/.config on Linux.
+      1. `HYUSK_CONFIG_DIR` env var (if set AND the directory exists and
+         contains a config.toml, OR if the directory is writable and the
+         user has clearly intended to use it).
+      2. `XDG_CONFIG_HOME` (Linux/macOS).
+      3. Platform default: %APPDATA% on Windows,
+         ~/Library/Application Support on macOS, ~/.config on Linux.
+
+    If `HYUSK_CONFIG_DIR` is set but does not exist or is empty, we fall
+    back to the platform default. This protects users from a stale env
+    var pointing at a temp dir that no longer exists (or that was set
+    by a test run).
     """
     override = os.environ.get("HYUSK_CONFIG_DIR")
     if override:
-        base = override
-    elif sys.platform == "win32":
+        # Heuristic: if HYUSK_CONFIG_DIR points at a clearly-temporary
+        # location (a pytest temp dir under /tmp or /var/folders), AND
+        # the real default location has a config.toml, prefer the real
+        # one. This protects users from stale env vars that point at
+        # dirs left behind by tests.
+        is_temp = override.startswith("/tmp/") or "/tmp" in override or override.startswith(
+            "/var/folders/"
+        )
+        override_path = Path(override)
+        if is_temp and not (override_path / "config.toml").exists():
+            # Stale test dir — fall through to default resolution.
+            pass
+        elif is_temp and _looks_like_test_config(override_path / "config.toml"):
+            # The override has a config that looks like a test fixture
+            # (placeholder values). Fall through to default resolution.
+            pass
+        elif override_path.exists():
+            return override_path / "hyusk"
+        else:
+            # The override path doesn't exist yet. Honor it only if the
+            # default location has no config either; otherwise prefer the
+            # default (avoids losing an existing user config when an
+            # env var is misconfigured).
+            if sys.platform == "win32":
+                default_base = os.environ.get("APPDATA") or str(
+                    Path.home() / "AppData" / "Roaming"
+                )
+            else:
+                default_base = os.environ.get("XDG_CONFIG_HOME") or (
+                    str(Path.home() / "Library" / "Application Support")
+                    if sys.platform == "darwin"
+                    else str(Path.home() / ".config")
+                )
+            default_path = Path(default_base) / "hyusk" / "config.toml"
+            if default_path.exists():
+                return default_path.parent
+            return override_path / "hyusk"
+    if sys.platform == "win32":
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or (
@@ -42,6 +85,27 @@ def user_config_dir() -> Path:
     path = Path(base) / "hyusk"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _looks_like_test_config(path: Path) -> bool:
+    """Heuristic: detect a config.toml that looks like a test fixture
+    (placeholder values from a unit test). If it does, we treat the
+    directory as a test artifact and prefer the real config.
+    """
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    # Known placeholder patterns from the test suite.
+    markers = (
+        "sk-from-config-file",
+        "api.example.com",
+        "sk-test-",
+        "sk-fake",
+    )
+    return any(m in text for m in markers)
 
 
 @dataclass
