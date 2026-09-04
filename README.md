@@ -3,48 +3,46 @@
 > A small, clean, extensible foundation for a cross-platform **computer agent**.
 
 Hyusk is a local CLI agent that can run shell commands, read and write files,
-inspect processes, and inspect git repositories — through natural language. V2
-adds a long-running daemon and a WebSocket transport so future mobile, voice,
-and remote clients can plug into the same core without touching it.
+inspect processes, and inspect git repositories — through natural language. V3
+adds **concurrent agent tasks with steering and cancellation** so you can
+fire off a long-running job and keep talking to Hyusk while it works.
+
+The architecture is modular so future voice clients, phone apps, remote
+clients, and coding-agent integrations can plug into the same core without
+touching it.
 
 ---
 
-## What is new in V2
+## What is new in V3
 
-- **`hyusk daemon start|stop|status`** — long-running local daemon hosting
-  the agent, sessions, and event stream.
-- **WebSocket transport** — the daemon speaks a small JSON protocol. The CLI
-  is a thin client that connects to the daemon when one is running, and
-  falls back to an in-process agent when not.
-- **Streaming LLM responses** — both the OpenAI-compatible and Anthropic
-  providers emit incremental text deltas; the CLI renders them as they
-  arrive.
-- **Anthropic provider** — `HYUSK_LLM_PROVIDER=anthropic` to use the
-  Anthropic Messages API.
-- **53 tests passing**, including end-to-end WebSocket daemon tests with a
-  fake LLM provider.
+- **Concurrent agent runs.** Every `run` returns a `task_id` immediately.
+  Multiple tasks execute in parallel. The CLI multiplexes events from all
+  running tasks.
+- **Steering (`steer <id> <message>`).** Inject a follow-up user message
+  into a running task. The agent picks it up between tool calls.
+- **Cancellation (`cancel <id>`).** Stop a running task cleanly. The current
+  tool call finishes, then the agent loop exits.
+- **Background mode (`bg: <prompt>`).** Start a task without waiting for
+  it; keep chatting in the foreground.
+- **ask routing.** The daemon no longer auto-grants destructive tool calls.
+  It forwards `ask` decisions to the client that started the task. The CLI
+  prompts; a future mobile client can implement its own prompt.
+- **60 tests passing**, including concurrent-task and steering coverage.
 
-## What it does today (V2)
+## What V1 and V2 already shipped
 
 - Interactive REPL and one-shot commands.
-- LLM-driven tool calling (OpenAI-compatible or Anthropic).
-- Streaming responses (real SSE for both providers).
-- Filesystem tools (`list_directory`, `read_file`, `write_file`) with safe
-  defaults.
-- Shell tool with timeout, structured stdout/stderr/exit/duration results.
-- Process tools (`list_processes`, `kill_process`).
-- Git tools (`git.status`, `git.diff`, `git.log`, `git.branch`).
-- Pluggable permission policy; destructive tools always require
-  interactive confirmation by default.
-- Sessions are persisted as JSON and can be resumed.
-- Lightweight typed event bus — the same bus is exposed over WebSocket.
-- Structured logging with secret-scrubbing.
-- Daemon with `start|stop|status` lifecycle and pid file.
+- OpenAI-compatible and Anthropic providers (both stream SSE).
+- Filesystem, shell, process, and git tools.
+- Pluggable permission policy; destructive tools require confirmation.
+- JSON-persisted sessions that can be resumed.
+- Typed event bus (the same bus is exposed over WebSocket).
+- Long-running daemon with `start|stop|status` and a pid file.
 
-## What is **not** built yet (V2 still does not ship these)
+## What is **not** built yet
 
-V2 still does **not** ship these — the interfaces are designed so they
-land without rewriting the core:
+V3 does **not** ship these — the interfaces are designed so they land
+without rewriting the core:
 
 - Wake-word / voice transcription / text-to-speech.
 - Mobile app, remote control, cloud backend.
@@ -73,141 +71,128 @@ uv sync --extra dev
 uv run hyusk --help
 ```
 
-Or, as a pip-installable package:
-
-```bash
-pip install hyusk
-```
-
 ---
 
 ## Configuration
 
-Loaded from (in order): environment variables prefixed with `HYUSK_`, a
-TOML config file in the platform user-config dir, then built-in defaults.
+Loaded from (in order): env vars prefixed with `HYUSK_`, a TOML file in
+the platform user-config dir, then built-in defaults.
 
 | Variable                | Purpose                                       |
 |-------------------------|-----------------------------------------------|
 | `HYUSK_LLM_PROVIDER`    | `openai` (default) or `anthropic`             |
-| `HYUSK_LLM_MODEL`       | model name (e.g. `gpt-4o-mini`, `claude-3-5-sonnet-latest`) |
+| `HYUSK_LLM_MODEL`       | model name                                    |
 | `HYUSK_LLM_API_KEY`     | API key                                       |
 | `HYUSK_LLM_BASE_URL`    | OpenAI-compatible base URL                    |
 | `HYUSK_LLM_STREAM`      | `1`/`true` (default) to stream responses     |
-| `OPENAI_API_KEY`        | fallback for the API key                      |
-| `ANTHROPIC_API_KEY`     | fallback for the API key                      |
 | `HYUSK_DAEMON_HOST`     | daemon bind host (default `127.0.0.1`)        |
 | `HYUSK_DAEMON_PORT`     | daemon port (default `8765`)                  |
 | `HYUSK_LOG_LEVEL`       | `DEBUG`/`INFO`/`WARNING`/`ERROR`              |
 
-Example `config.toml` at the platform user-config dir:
-
-```toml
-[llm]
-provider = "anthropic"     # or "openai"
-model = "claude-3-5-sonnet-latest"
-api_key = "sk-..."         # prefer env var
-
-[agent]
-max_iterations = 25
-
-[daemon]
-host = "127.0.0.1"
-port = 8765
-
-[permissions]
-require_prompt = ["kill_process"]
-```
-
-API keys are never logged (a `SecretFilter` strips common key names).
+API keys are never logged.
 
 ---
 
 ## Usage
 
-### Start the daemon (optional but recommended)
+### Start the daemon (recommended)
 
 ```bash
-hyusk --daemon-action start      # foreground
-hyusk --daemon-action status     # is it running?
-hyusk --daemon-action stop       # stop it
+hyusk --daemon-action start
+hyusk --daemon-action status
+hyusk --daemon-action stop
 ```
 
-Once the daemon is running, every `hyusk` command — REPL, one-shot, or
-session list — uses the daemon transparently. If the daemon is not
-running, the CLI starts an in-process agent (V1 behavior).
+When the daemon is running, every `hyusk` command — REPL, one-shot, or
+session list — uses it transparently. If not, the CLI starts an in-process
+agent (V1 behavior).
 
 ### One-shot
 
 ```bash
 hyusk "show me the processes using the most CPU"
 hyusk "what is in README.md?"
-hyusk "summarize recent git history"
 hyusk --no-daemon "..."        # force in-process agent
 hyusk --daemon-only "..."      # fail if daemon is unreachable
 ```
 
-### Interactive REPL
+### Interactive REPL — concurrent tasks
 
 ```bash
 $ hyusk
-hyusk v0.2.0  (connected to daemon at 127.0.0.1:8765)
-(type 'exit' or Ctrl-D to quit, 'help' for commands)
-hyusk > list the files in this directory
+hyusk v0.3.0  (connected to daemon at 127.0.0.1:8765)
+(type 'help' for commands)
+hyusk > bg: count files in /usr/local recursively
 
--> list_directory
+[abcd1234] started task abcd1234 (session ...)
+hyusk > list the files in this directory instead
+
+[efgh5678] -> list_directory
    path: .
    ok (12 ms)
 
 Here are the contents...
 
-hyusk > tools
-available tools (resolved from server):
-  - list_directory, read_file, write_file
-  - shell.execute, list_processes, kill_process
-  - git.status, git.diff, git.log, git.branch
+hyusk > tasks
+  abcd1234  running  iter=2  'count files in /usr/local recursively'
+  efgh5678  done     iter=1  'list the files in this directory instead'
 
-hyusk > exit
+hyusk > steer abcd1234 skip node_modules
+[abcd1234] [steer] skip node_modules
+
+hyusk > cancel efgh5678
+cancel: efgh5678 ok=True
+
+hyusk > help
+commands:
+  bg: <prompt>            start a background task
+  steer <id> <message>    inject a follow-up message into a running task
+  cancel <id>             cancel a running task
+  tasks                   list tasks (active + recent)
+  session                 show the current session id
+  reset                   next prompt starts a new session
+  tools                   list available tools
+  help                    show this list
+  exit | quit | :q        leave the REPL
 ```
 
 ### Sessions
 
 ```bash
-hyusk --list-sessions         # queries the daemon if running
-hyusk --session <id> "..."    # resume a session
-```
-
-### Useful flags
-
-```bash
-hyusk --model claude-3-5-sonnet-latest "..."
-hyusk --no-confirm "..."      # auto-allow destructive tools (careful)
+hyusk --list-sessions
+hyusk --session <id> "..."    # resume
 ```
 
 ---
 
-## Daemon protocol
-
-V2 clients (and future mobile/voice clients) speak this JSON-over-WebSocket
-protocol with the daemon:
+## Daemon protocol (V3)
 
 ```text
 client -> server:
   {"type": "run", "session_id": "<id|new>", "input": "...", "model": "..."}
   {"type": "list_sessions"}
-  {"type": "load_session", "id": "..."}
+  {"type": "list_tasks"}
+  {"type": "cancel", "task_id": "..."}
+  {"type": "steer", "task_id": "...", "input": "..."}
+  {"type": "grant", "ask_id": "...", "granted": bool}
   {"type": "ping"}
 
 server -> client:
-  {"type": "event", "event": "agent.started|tool.started|...", "data": {...}}
-  {"type": "done", "session_id": "...", "iterations": N, "text_chars": N}
+  {"type": "task", "task_id": "...", "session_id": "..."}
+  {"type": "event", "task_id": "...", "session_id": "...",
+                 "event": "agent.started|tool.started|...", "data": {...}}
+  {"type": "ask", "ask_id": "...", "task_id": "...", "tool": "...",
+                 "arguments": {...}}
+  {"type": "task_done", "task_id": "...", "state": "done|cancelled|errored",
+                    "iterations": N, "cancelled": bool, "error": "..."}
   {"type": "error", "message": "..."}
-  {"type": "sessions", "sessions": [...]}
-  {"type": "session", "session": {"id":..., "messages":[...]}}
   {"type": "pong"}
+  {"type": "sessions", "sessions": [...]}
+  {"type": "tasks", "tasks": [...]}
 ```
 
-There is no separate "streaming" message type — events already stream.
-Text comes through `agent.text` with `delta: true` for partial chunks.
+Multiple tasks can run at once; every event is tagged with `task_id` so
+the client can multiplex.
 
 ---
 
@@ -236,13 +221,12 @@ Text comes through `agent.text` with `delta: true` for partial chunks.
 - Destructive tools always require interactive confirmation by default.
 - In non-interactive contexts, `kill_process` is **refused** rather than
   silently auto-allowed.
-- `--no-confirm` bypasses prompts (subject to deny rules).
-- Tool output is truncated at `agent.max_tool_output_bytes`.
+- `--no-confirm` bypasses prompts (still subject to deny rules).
 - API keys are scrubbed from logs.
 
-In V2, the **daemon does not prompt**: the local CLI is responsible for
-prompting at the terminal. The daemon grants all `ask` calls (a future
-version can route them back to the connected client).
+When the daemon is running, the **client that started a task** is the one
+that gets the `ask` message. The CLI prompts; a future mobile/voice
+client implements its own prompt.
 
 ---
 
@@ -259,22 +243,20 @@ uv run mypy src/hyusk
 
 ```
 hyusk/
-├── README.md
-├── LICENSE
-├── docs/
-│   └── architecture.md
+├── README.md, LICENSE, .gitignore, pyproject.toml
+├── docs/architecture.md
 ├── src/hyusk/
-│   ├── cli/        # argparse + REPL rendering + daemon subcommands
-│   ├── agent/      # agent loop (streaming-aware)
+│   ├── cli/        # argparse, REPL, daemon subcommands
+│   ├── agent/      # agent loop (streaming + steering) and TaskManager
 │   ├── llm/        # provider abstraction + OpenAI-compat + Anthropic
 │   ├── tools/      # tool base + registry + per-tool modules
 │   ├── permissions/# permission policy
-│   ├── sessions/   # session persistence
+│   ├── sessions/   # session persistence + SessionStore
 │   ├── events/     # event bus
-│   ├── daemon/     # WebSocket server (V2)
-│   ├── client/     # WebSocket client used by the CLI (V2)
-│   ├── platform/   # OS abstractions (shell, process, filesystem)
-│   ├── config/     # config loader (now includes daemon + stream)
+│   ├── daemon/     # WebSocket server (concurrent tasks V3)
+│   ├── client/     # WebSocket client (V3: submit/cancel/steer/list_tasks)
+│   ├── platform/   # OS abstractions
+│   ├── config/     # config loader
 │   └── core/       # errors, logging
 └── tests/
 ```
@@ -284,7 +266,6 @@ hyusk/
 1. Implement a function returning a `Tool` (see `tools/filesystem/tools.py`).
 2. Register it from `register_*_tools(registry)`.
 3. Call the registrar in `daemon/registry_builder.py:build_registry()`.
-4. Add a test under `tests/test_<area>.py`.
 
 ### Adding a new LLM provider
 
@@ -294,18 +275,15 @@ file under `src/hyusk/llm/`. Then add a branch in
 
 ---
 
-## Roadmap (V3+)
+## Roadmap (V4+)
 
-- Voice client (subscribe to daemon over WebSocket, push transcribed audio).
-- Mobile app (iOS/Android) talking to the daemon.
+- Voice / mobile clients (subscribe to the daemon over WebSocket).
 - Persistent PTY-backed shell sessions.
 - Sandboxed tool execution.
 - Browser automation as a new tool category.
 - Plugin marketplace.
-- Routing `ask` decisions from the daemon back to the connected client.
 
-See [`docs/architecture.md`](docs/architecture.md) for the architecture
-that makes these possible without rewriting the core.
+See [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
