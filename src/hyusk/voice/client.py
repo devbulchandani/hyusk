@@ -69,18 +69,35 @@ def _read_text_loop() -> list[str]:
         return [line]
 
 
-def _is_speech(chunk, threshold: float = 0.01) -> bool:
-    """Return True if the audio chunk looks like speech (above energy threshold)."""
+def _rms(chunk) -> float:
+    """Return the root-mean-square amplitude of an audio chunk."""
     import numpy as np
+    return float(np.sqrt(np.mean(chunk * chunk)))
 
-    return bool(np.abs(chunk).mean() > threshold)
+
+def _is_speech(chunk, threshold: float = 0.003) -> bool:
+    """Return True if the audio chunk looks like speech.
+
+    The default threshold (0.003) is conservative — quiet rooms with
+    built-in laptop mics can produce RMS well below 0.01 during
+    speech. Increase this if the mic picks up too much background;
+    decrease it if speech isn't being detected.
+    """
+    return _rms(chunk) > threshold
+
+
+def _level_bar(rms: float, width: int = 20) -> str:
+    """Return a small ASCII level meter showing how loud `rms` is."""
+    # Map 0..0.1 to 0..width (speech typically peaks around 0.05-0.1).
+    fill = min(width, int(rms * width * 10))
+    return "[" + "█" * fill + "·" * (width - fill) + "]"
 
 
 async def _record_and_transcribe(
     stt_backend,
     *,
     max_duration: float = 8.0,
-    silence_timeout: float = 1.2,
+    silence_timeout: float = 1.0,
 ) -> str:
     """Record from the microphone until the user stops talking, then transcribe.
 
@@ -89,7 +106,8 @@ async def _record_and_transcribe(
       - stop after `silence_timeout` seconds of below-threshold audio
       - hard-cap at `max_duration` seconds
 
-    The user can also press Enter to send early (handled by the caller).
+    A live level meter is drawn to stderr so the user can see that the
+    mic is picking up audio.
     """
     try:
         import sounddevice as sd
@@ -114,52 +132,94 @@ async def _record_and_transcribe(
     chunk_duration = 0.05  # 50 ms per chunk
     chunk_samples = int(sample_rate * chunk_duration)
 
-    print("[voice] listening... (speak; auto-stops when you pause)", flush=True)
+    # Auto-calibrate the noise floor: take a few chunks of "silence" and
+    # set the speech threshold to several times the noise RMS. This
+    # adapts to quiet rooms and noisy environments automatically.
+    sys.stderr.write("[voice] calibrating noise floor... ")
+    sys.stderr.flush()
+    noise_chunks: list = []
+    try:
+        with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+            for _ in range(20):  # ~1 second of "silence"
+                chunk, _ = stream.read(chunk_samples)
+                noise_chunks.append(chunk.copy())
+    except Exception as exc:
+        print(f"[voice] cannot open mic: {exc}. Falling back to text.", file=sys.stderr)
+        return input("> ").strip()
+    noise_rms = max((_rms(c) for c in noise_chunks), default=0.001)
+    threshold = max(0.003, noise_rms * 4.0)
+    sys.stderr.write(
+        f"noise_rms={noise_rms:.4f}, threshold={threshold:.4f}\n"
+    )
+    sys.stderr.flush()
 
-    # Record chunks. We track:
-    #  - is_speaking: have we heard any speech yet?
-    #  - silence_chunks: how many consecutive chunks have been below threshold?
-    #  - elapsed: total time since recording started
+    if noise_rms > 0.3:
+        print(
+            f"[voice] WARNING: noise floor is high ({noise_rms:.3f}). "
+            "Try a quieter room or check mic levels.",
+            file=sys.stderr,
+        )
+
+    # Now listen for actual speech.
+    sys.stderr.write(
+        f"[voice] listening (max {max_duration:.0f}s, threshold={threshold:.4f}). "
+        "Speak; auto-stops when you pause.\n"
+    )
+    sys.stderr.flush()
+
     is_speaking = False
     silence_chunks = 0
     elapsed = 0.0
     audio_chunks: list = []
+    last_bar = ""
 
-    def _all_input() -> bool:
-        """Check if there is any default input device (mic plugged in)."""
-        try:
-            return sd.query_devices(kind="input") and len(sd.query_devices(kind="input")) > 0
-        except Exception:
-            return False
+    def _show_meter(rms: float, is_speech: bool) -> None:
+        nonlocal last_bar
+        bar = _level_bar(rms)
+        marker = "▌ speaking" if is_speech else "  ...    "
+        line = f"\r    {bar} {marker}"
+        # Pad to overwrite the previous line.
+        line = line.ljust(len(last_bar) + 10)
+        last_bar = line
+        sys.stderr.write(line)
+        sys.stderr.flush()
 
-    if not _all_input():
-        print("[voice] no input device found. Falling back to text.", file=sys.stderr)
-        return input("> ").strip()
-
-    # We want to listen indefinitely (within the max_duration cap) and
-    # start capturing only when the user actually speaks.
     try:
         with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
             while elapsed < max_duration:
                 chunk, _ = stream.read(chunk_samples)
+                rms = _rms(chunk)
                 audio_chunks.append(chunk.copy())
                 elapsed += chunk_duration
-                if _is_speech(chunk):
+
+                if rms > threshold:
                     is_speaking = True
                     silence_chunks = 0
-                elif is_speaking:
-                    silence_chunks += 1
-                    silence_secs = silence_chunks * chunk_duration
-                    if silence_secs >= silence_timeout:
-                        break
+                    _show_meter(rms, is_speech=True)
+                else:
+                    if is_speaking:
+                        silence_chunks += 1
+                        silence_secs = silence_chunks * chunk_duration
+                        _show_meter(rms, is_speech=False)
+                        if silence_secs >= silence_timeout:
+                            break
+                    else:
+                        # Pre-speech silence — show the meter occasionally
+                        # so the user can see the mic is alive.
+                        if int(elapsed * 5) % 5 == 0:
+                            _show_meter(rms, is_speech=False)
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        print(f"[voice] recording failed: {exc}", file=sys.stderr)
+        print(f"\n[voice] recording failed: {exc}", file=sys.stderr)
         return ""
 
+    # Clear the meter line.
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
     if not is_speaking or not audio_chunks:
-        print("[voice] (no speech detected)", file=sys.stderr)
+        print("[voice] (no speech detected — try speaking louder or check the mic)", file=sys.stderr)
         return ""
 
     audio = np.concatenate(audio_chunks, axis=0)
@@ -168,7 +228,12 @@ async def _record_and_transcribe(
         keep = max(1, len(audio_chunks) - silence_chunks)
         audio = np.concatenate(audio_chunks[:keep], axis=0)
 
-    print(f"[voice] captured {len(audio) / sample_rate:.1f}s of audio; transcribing...", file=sys.stderr)
+    duration = len(audio) / sample_rate
+    if duration < 0.3:
+        print(f"[voice] (captured only {duration:.2f}s; too short, ignoring)", file=sys.stderr)
+        return ""
+
+    print(f"[voice] captured {duration:.1f}s of audio; transcribing...", file=sys.stderr)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav.write(f.name, sample_rate, (audio * 32767).astype("int16"))
