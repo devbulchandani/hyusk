@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 import tempfile
 from typing import Any
@@ -68,11 +69,28 @@ def _read_text_loop() -> list[str]:
         return [line]
 
 
-async def _record_and_transcribe(stt_backend) -> str:
-    """Record audio from the microphone and return the transcript."""
-    if not stt_backend.is_available():
-        print("[voice] no STT backend available; falling back to text mode.", file=sys.stderr)
-        return input("> ").strip()
+def _is_speech(chunk, threshold: float = 0.01) -> bool:
+    """Return True if the audio chunk looks like speech (above energy threshold)."""
+    import numpy as np
+
+    return bool(np.abs(chunk).mean() > threshold)
+
+
+async def _record_and_transcribe(
+    stt_backend,
+    *,
+    max_duration: float = 8.0,
+    silence_timeout: float = 1.2,
+) -> str:
+    """Record from the microphone until the user stops talking, then transcribe.
+
+    Uses a simple energy-based VAD:
+      - start recording when input is detected
+      - stop after `silence_timeout` seconds of below-threshold audio
+      - hard-cap at `max_duration` seconds
+
+    The user can also press Enter to send early (handled by the caller).
+    """
     try:
         import sounddevice as sd
     except ImportError:
@@ -81,62 +99,87 @@ async def _record_and_transcribe(stt_backend) -> str:
             file=sys.stderr,
         )
         return input("> ").strip()
+    try:
+        import numpy as np
+    except ImportError:
+        print("[voice] mic mode needs numpy: `uv pip install numpy`", file=sys.stderr)
+        return input("> ").strip()
+    try:
+        import scipy.io.wavfile as wav
+    except ImportError:
+        print("[voice] mic mode needs scipy: `uv pip install scipy`", file=sys.stderr)
+        return input("> ").strip()
 
     sample_rate = 16000
-    duration = 5  # seconds per recording; press Enter to send earlier.
-    print("[voice] recording... (press Enter to send)", flush=True)
+    chunk_duration = 0.05  # 50 ms per chunk
+    chunk_samples = int(sample_rate * chunk_duration)
 
-    # Run recording in a thread so we can also watch for the user pressing Enter.
-    import threading
+    print("[voice] listening... (speak; auto-stops when you pause)", flush=True)
 
-    audio_chunks: list[Any] = []
-    recording = [True]
+    # Record chunks. We track:
+    #  - is_speaking: have we heard any speech yet?
+    #  - silence_chunks: how many consecutive chunks have been below threshold?
+    #  - elapsed: total time since recording started
+    is_speaking = False
+    silence_chunks = 0
+    elapsed = 0.0
+    audio_chunks: list = []
 
-    def _record() -> None:
+    def _all_input() -> bool:
+        """Check if there is any default input device (mic plugged in)."""
         try:
-            with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
-                while recording[0]:
-                    chunk, _ = stream.read(int(sample_rate * 0.1))
-                    audio_chunks.append(chunk.copy())
-        except Exception as exc:
-            print(f"[voice] recording failed: {exc}", file=sys.stderr)
+            return sd.query_devices(kind="input") and len(sd.query_devices(kind="input")) > 0
+        except Exception:
+            return False
 
-    rec_thread = threading.Thread(target=_record, daemon=True)
-    rec_thread.start()
+    if not _all_input():
+        print("[voice] no input device found. Falling back to text.", file=sys.stderr)
+        return input("> ").strip()
 
-    # Wait for the user to press Enter (or auto-stop after `duration` seconds).
-    loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-
-    def _on_enter() -> None:
-        loop.call_soon_threadsafe(stop.set)
-
-    enter_thread = threading.Thread(target=_on_enter, daemon=True)
-    enter_thread.start()
+    # We want to listen indefinitely (within the max_duration cap) and
+    # start capturing only when the user actually speaks.
     try:
-        await asyncio.wait_for(stop.wait(), timeout=duration)
-    except TimeoutError:
+        with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+            while elapsed < max_duration:
+                chunk, _ = stream.read(chunk_samples)
+                audio_chunks.append(chunk.copy())
+                elapsed += chunk_duration
+                if _is_speech(chunk):
+                    is_speaking = True
+                    silence_chunks = 0
+                elif is_speaking:
+                    silence_chunks += 1
+                    silence_secs = silence_chunks * chunk_duration
+                    if silence_secs >= silence_timeout:
+                        break
+    except KeyboardInterrupt:
         pass
-    finally:
-        recording[0] = False
-        rec_thread.join(timeout=2.0)
-
-    if not audio_chunks:
+    except Exception as exc:
+        print(f"[voice] recording failed: {exc}", file=sys.stderr)
         return ""
-    import numpy as np
+
+    if not is_speaking or not audio_chunks:
+        print("[voice] (no speech detected)", file=sys.stderr)
+        return ""
 
     audio = np.concatenate(audio_chunks, axis=0)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        import scipy.io.wavfile as wav
+    # Trim trailing silence (last `silence_chunks` chunks).
+    if silence_chunks > 0:
+        keep = max(1, len(audio_chunks) - silence_chunks)
+        audio = np.concatenate(audio_chunks[:keep], axis=0)
 
+    print(f"[voice] captured {len(audio) / sample_rate:.1f}s of audio; transcribing...", file=sys.stderr)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav.write(f.name, sample_rate, (audio * 32767).astype("int16"))
         path = f.name
     try:
         text = stt_backend.transcribe(path)
+    except Exception as exc:
+        print(f"[voice] transcription failed: {exc}", file=sys.stderr)
+        text = ""
     finally:
         try:
-            import os
-
             os.unlink(path)
         except OSError:
             pass
