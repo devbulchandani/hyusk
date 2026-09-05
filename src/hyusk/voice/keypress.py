@@ -126,6 +126,11 @@ def install_keypress_handler(
     thread = threading.Thread(target=watcher, daemon=True)
 
     class _Handle:
+        def __init__(self):
+            # When set, the in-flight recording should be aborted and
+            # its audio discarded. The recorder polls this.
+            self.abort_event = threading.Event()
+
         def stop(self) -> None:
             stop_event.set()
             thread.join(timeout=1.0)
@@ -136,6 +141,7 @@ def install_keypress_handler(
 
         def clear(self) -> None:
             keypressed_event.clear()
+            self.abort_event.clear()
 
     # We can't return the handle from a tuple; expose it on the thread
     # object so callers can ``thread.handle.stop()``.

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hyusk</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="scene"></div>
+
+  <header class="hud-top">
+    <div class="brand">
+      <span class="logo">◉</span>
+      <span class="name">Hyusk</span>
+      <span class="version" id="version">v?</span>
+    </div>
+    <div class="status" id="status">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">connecting...</span>
+    </div>
+  </header>
+
+  <aside class="side" id="side">
+    <header class="side-head">
+      <h2>Activity</h2>
+    </header>
+    <div class="tools" id="tools">
+      <p class="empty">No tools running.</p>
+    </div>
+  </aside>
+
+  <main class="chat" id="chat">
+    <div class="messages" id="messages"></div>
+    <form class="input-bar" id="form" autocomplete="off">
+      <button type="button" class="mic-btn" id="mic-btn" title="Record from microphone">
+        <svg viewBox="0 0 24 24" width="22" height="22">
+          <path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 11h-2z" />
+        </svg>
+      </button>
+      <input type="text" id="input" placeholder="Ask Hyusk anything..." autocomplete="off" />
+      <button type="submit" id="send">Send</button>
+    </form>
+    <div class="hint" id="hint">Press Enter to send</div>
+  </main>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/[email protected]/build/three.module.js"
+    }
+  }
+  </script>
+  <script type="module" src="/static/scene.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

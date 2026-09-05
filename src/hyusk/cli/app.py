@@ -571,6 +571,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="(config) value to set.",
     )
+    parser.add_argument(
+        "--webui-host",
+        default=None,
+        help="(webui) Host to bind to (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--webui-port",
+        type=int,
+        default=None,
+        help="(webui) Port to bind to (default: 8080).",
+    )
+    parser.add_argument(
+        "--webui-no-open",
+        action="store_true",
+        help="(webui) Don't open the browser automatically.",
+    )
     return parser
 
 
@@ -710,7 +726,29 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.daemon_action:
         return _cmd_daemon(argparse.Namespace(daemon_action=args.daemon_action))
+
+    # Run the web UI.
+    if args.webui is not None:
+        from ..webui.server import serve as _webui_serve
+        _webui_serve(
+            host=args.webui_host or "127.0.0.1",
+            port=args.webui_port or 8080,
+            open_browser=not args.webui_no_open,
+        )
+        return 0
     if args.list_sessions:
+        return _cmd_daemon(argparse.Namespace(daemon_action=args.daemon_action))
+
+    # Run the web UI.
+    if args.webui is not None:
+        from ..webui.server import serve as _webui_serve
+        _webui_serve(
+            host=args.webui_host or "127.0.0.1",
+            port=args.webui_port or 8080,
+            open_browser=not args.webui_no_open,
+        )
+        return 0
+
         if daemon_reachable(cfg.daemon.host, cfg.daemon.port):
             try:
                 sessions = list_sessions_sync(cfg.daemon.host, cfg.daemon.port)

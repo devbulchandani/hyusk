@@ -1,6 +1,6 @@
 [project]
 name = "hyusk"
-version = "0.5.0"
+version = "0.6.0"
 description = "Hyusk: a cross-platform computer agent."
 readme = "README.md"
 authors = [
@@ -24,6 +24,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Web UI: serves a browser-based chat interface with a 3D particle
+# sphere. Pulls in FastAPI + uvicorn for the HTTP/WebSocket server.
+webui = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "pydantic>=2.5",
+]
 dev = [
     "pytest>=8.0",
     "pytest-timeout>=2.0",
@@ -54,7 +62,7 @@ mic = [
     "hyusk[voice,tts,stt]",
 ]
 all = [
-    "hyusk[voice,tts,stt,tts-cloud]",
+    "hyusk[voice,tts,stt,tts-cloud,webui]",
 ]
 
 [project.scripts]

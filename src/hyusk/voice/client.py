@@ -98,8 +98,9 @@ def _level_bar(rms: float, width: int = 20) -> str:
 async def _record_and_transcribe(
     stt_backend,
     *,
-    max_duration: float = 8.0,
+    max_duration: float = 6.0,
     silence_timeout: float = 1.0,
+    abort_event: "threading.Event | None" = None,
 ) -> str:
     """Record from the microphone until the user stops talking, then transcribe.
 
@@ -139,10 +140,16 @@ async def _record_and_transcribe(
     # adapts to quiet rooms and noisy environments automatically.
     sys.stderr.write("[voice] calibrating noise floor... ")
     sys.stderr.flush()
+
+    def _aborted() -> bool:
+        return abort_event is not None and abort_event.is_set()
+
     noise_chunks: list = []
     try:
         with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
             for _ in range(20):  # ~1 second of "silence"
+                if _aborted():
+                    return ""
                 chunk, _ = stream.read(chunk_samples)
                 noise_chunks.append(chunk.copy())
     except Exception as exc:
@@ -186,9 +193,20 @@ async def _record_and_transcribe(
         sys.stderr.write(line)
         sys.stderr.flush()
 
+    # If an abort_event is set (e.g. user pressed Space to interrupt
+    # a previous turn), discard the calibration audio and the recording.
+    def _aborted() -> bool:
+        return abort_event is not None and abort_event.is_set()
+
+    if _aborted():
+        return ""
+
     try:
         with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
             while elapsed < max_duration:
+                # Check for abort periodically (every 50ms).
+                if _aborted():
+                    return ""
                 chunk, _ = stream.read(chunk_samples)
                 rms = _rms(chunk)
                 audio_chunks.append(chunk.copy())
@@ -344,15 +362,36 @@ async def _run_mic_mode(
         "Ctrl-D to exit.",
         flush=True,
     )
+    # Keep a flag so the keypress handler can short-circuit the recorder.
+    # When the user presses Space, we cancel the current daemon task,
+    # stop TTS playback, and discard the in-flight audio (so the key click
+    # doesn't get sent to the agent as a fake transcript).
+    record_abort = threading.Event()
+
+    # When the keypress handler fires, mark the recorder's abort flag.
+    # We monkey-patch the on_interrupt callback below (in the main
+    # function) to do this in addition to the existing TTS / daemon
+    # cancel logic.
+
     try:
         while True:
-            text = await _record_and_transcribe(backend)
+            record_abort.clear()
+            text = await _record_and_transcribe(
+                backend, abort_event=record_abort
+            )
+            # Reset the keypress-cancelled flag for the next turn.
+            cancel_event.clear()
             if not text:
                 continue
             if text.strip().lower() in ("exit", "quit"):
                 return 0
             print(f"[voice] heard: {text!r}", file=sys.stderr)
-            await _run_turn(client, text, model, tts_backend)
+            await _run_turn(
+                client, text, model, tts_backend, record_abort=record_abort
+            )
+            # Brief "ready" hint so the user knows the mic is listening again
+            sys.stderr.write("[listening]\n")
+            sys.stderr.flush()
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
@@ -360,6 +399,12 @@ async def _run_mic_mode(
         # the error and continue listening.
         print(f"[voice] turn error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 0
+    finally:
+        if kp_handle_holder:
+            try:
+                kp_handle_holder[0].stop()
+            except Exception:
+                pass
     return 0
 
 
@@ -567,7 +612,8 @@ class _TTSSpeaker:
                     pass
                 self._stream = None
 async def _run_turn(
-    client: DaemonClient, text: str, model: str | None, tts_backend
+    client: DaemonClient, text: str, model: str | None, tts_backend,
+    record_abort: "threading.Event | None" = None,
 ) -> None:
     """Submit a single turn; stream the reply as TTS while it generates.
 
@@ -624,19 +670,27 @@ async def _run_turn(
             asyncio.run_coroutine_threadsafe(client.cancel(tid), loop)
         if tts is not None:
             tts.interrupt()
+        # Tell the recorder to discard the in-flight audio so the key
+        # click noise doesn't get sent to the agent.
+        if record_abort is not None:
+            record_abort.set()
         sys.stderr.write("\n[interrupted]\n")
         sys.stderr.flush()
 
-    keypress_ctx, keypress_thread, keypress_handle = install_keypress_handler(
-        on_interrupt=_trigger_interrupt, fd=0
-    )
+    # Keypress handler is installed by _run_mic_mode, which passes
+    # us a record_abort to discard the next recording.
+    pass
 
     try:
         await client.submit(input_text=text, model=model)
 
-        # Wait for done OR interrupt.
+        # Wait for done OR cancel_event OR keypress (legacy path).
         while True:
             done_task = asyncio.ensure_future(_await_done(done_future))
+            if record_abort is not None and record_abort.is_set():
+                # Cancel was requested via the mic keypress handler.
+                # Wait a moment for the daemon to acknowledge, then return.
+                pass  # fall through to the existing interrupt path
             press_task = asyncio.ensure_future(_await_press(keypress_handle))
             try:
                 done_set, _ = await asyncio.wait(
@@ -663,9 +717,9 @@ async def _run_turn(
                     break
                 break
 
-            # Interrupted. Tell the daemon to stop the task and break
-            # out of the wait loop. The TTS was already interrupted
-            # by _trigger_interrupt.
+            # Interrupted via keypress. Tell the daemon to stop the
+            # task and break out of the wait loop. The TTS was
+            # already interrupted by _trigger_interrupt.
             if current_task_id[0] is not None:
                 try:
                     await client.cancel(current_task_id[0])
@@ -686,10 +740,8 @@ async def _run_turn(
         print(f"\n[error] {type(exc).__name__}: {exc}", file=sys.stderr)
         return
     finally:
-        try:
-            keypress_handle.stop()
-        except Exception:
-            pass
+        # Keypress handle is owned by _run_mic_mode; nothing to do here.
+        pass
 
     sys.stdout.write("\n")
     sys.stdout.flush()
