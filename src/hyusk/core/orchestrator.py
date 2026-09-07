@@ -161,8 +161,15 @@ class Orchestrator:
                     tool_result = await tool_registry.execute_tool(tool_call, task_id=task_id)
 
                     # Convert to message
+                    # Get tool_call_id from metadata (different providers use different keys)
+                    tool_call_id = (
+                        tool_call.metadata.get("tool_call_id")  # OpenAI format
+                        or tool_call.metadata.get("tool_use_id")  # Anthropic format
+                        or str(tool_call.id)  # Fallback to UUID
+                    )
+                    
                     tool_result_msg = create_tool_result_message(
-                        tool_call_id=tool_call.metadata.get("tool_use_id", str(tool_call.id)),
+                        tool_call_id=tool_call_id,
                         result=tool_result.output
                         if tool_result.status.value == "success"
                         else None,
