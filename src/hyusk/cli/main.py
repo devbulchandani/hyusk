@@ -214,6 +214,7 @@ def chat(model: str, stream: bool) -> None:
                 if stream:
                     # Streaming response
                     full_response = []
+                    tool_calls_made = []
                     async for chunk in orchestrator.stream_request(
                         user_message=user_input,
                         conversation_id=conversation_id,
@@ -225,9 +226,23 @@ def chat(model: str, stream: bool) -> None:
                             full_response.append(chunk.content)
 
                         if chunk.tool_call:
+                            tool_calls_made.append(chunk.tool_call)
                             console.print(
                                 f"\n[dim]→ Calling tool: {chunk.tool_call.tool_name}[/dim]"
                             )
+
+                    # If tools were called, get final response with handle_request
+                    if tool_calls_made and not full_response:
+                        console.print("[dim]→ Executing tools...[/dim]\n")
+                        console.print("[bold blue]Hyusk:[/bold blue] ", end="")
+                        response = await orchestrator.handle_request(
+                            user_message=user_input,
+                            conversation_id=conversation_id,
+                            model_type=model,
+                            tools=tool_schemas,
+                        )
+                        if response.content:
+                            console.print(response.content)
 
                     console.print("\n")
                 else:
