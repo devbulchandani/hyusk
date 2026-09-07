@@ -1,5 +1,6 @@
 """Message conversion utilities for LLM providers."""
 
+import json
 from typing import Any
 
 from hyusk.models import Message, MessageRole
@@ -143,6 +144,21 @@ def messages_to_openai_format(messages: list[Message]) -> list[dict[str, Any]]:
 
             msg_dict["content"] = content_parts
 
+        # If this is an assistant message with tool calls in metadata, add them
+        if msg.role == MessageRole.ASSISTANT and "tool_calls" in msg.metadata:
+            tool_calls_data = msg.metadata["tool_calls"]
+            if tool_calls_data:
+                msg_dict["tool_calls"] = []
+                for tc in tool_calls_data:
+                    msg_dict["tool_calls"].append({
+                        "id": tc.get("metadata", {}).get("tool_call_id", f"call_{tc.get('id', 'unknown')}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("tool_name", ""),
+                            "arguments": json.dumps(tc.get("arguments", {})),
+                        }
+                    })
+
         openai_messages.append(msg_dict)
 
     return openai_messages
@@ -170,8 +186,6 @@ def create_tool_result_message(
         if isinstance(result, str):
             content = result
         elif isinstance(result, dict) or isinstance(result, list):
-            import json
-
             content = json.dumps(result, indent=2)
         else:
             content = str(result)
